@@ -1,0 +1,10 @@
+.DS_Store
+._*
+*.ipa
+*.zip
+release/
+com.crossutility.quantumult-x_1.8.1_decrypted.ipa
+ws.stash.app_3.4.1_decrypted 2.ipa
+/tmp/
+build/
+*.log
