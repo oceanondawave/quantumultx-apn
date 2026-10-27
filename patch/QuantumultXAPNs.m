@@ -480,6 +480,14 @@ static __unsafe_unretained id currentMoreSettingsVC = nil;
         ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, selEnforceRoutes, NO);
         NSLog(@"[QX_APNs] protocol.enforceRoutes = NO");
     }
+
+    // 6. disconnectOnSleep: Explicitly NO!
+    // Prevents iOS from tearing down the VPN tunnel when the screen locks, ensuring APNs push notifications always stay connected.
+    SEL selDisconnectSleep = sel_registerName("setDisconnectOnSleep:");
+    if ([protocol respondsToSelector:selDisconnectSleep]) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, selDisconnectSleep, NO);
+        NSLog(@"[QX_APNs] protocol.disconnectOnSleep = NO");
+    }
 }
 
 - (void)restartTunnelIfPossible {
@@ -728,6 +736,14 @@ static void initialize_quantumultx_apns_patch(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         [[QuantumultXAPNsManager sharedManager] updateAndSavePreferences];
     });
+
+    // 6. Listen for app foreground/active events to re-verify preferences
+    [[NSNotificationCenter defaultCenter] addObserverForName:@"UIApplicationDidBecomeActiveNotification"
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification *note) {
+        [[QuantumultXAPNsManager sharedManager] updateAndSavePreferences];
+    }];
 
     NSLog(@"[QX_APNs] Initialization complete.");
 }

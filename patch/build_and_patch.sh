@@ -31,13 +31,17 @@ cp "$DIR/QuantumultXAPNs.dylib" "$FRAMEWORKS_PATH/QuantumultXAPNs.dylib"
 echo "=== 5. Injecting LC_LOAD_DYLIB into Mach-O ==="
 python3 "$DIR/inject_dylib.py" "$APP_PATH/Quantumult X" "@executable_path/Frameworks/QuantumultXAPNs.dylib" "$APP_PATH/Quantumult X"
 
-echo "=== 6. Re-signing App with FULL Original Entitlements ==="
-# IMPORTANT: DO NOT re-sign Quantumult X Tunnel.appex to avoid breaking NetworkExtension entitlements.
-# Only sign the injected dylib and the main app binary with its original entitlements preserved!
+echo "=== 6. Patching Quantumult X Tunnel binary (permanent APNs keepalive) ==="
+TUNNEL_APPEX="$APP_PATH/PlugIns/Quantumult X Tunnel.appex"
+TUNNEL_BIN="$TUNNEL_APPEX/Quantumult X Tunnel"
+python3 "$DIR/patch_tunnel.py" "$TUNNEL_BIN"
+
+echo "=== 7. Re-signing Tunnel Extension and App with Original Entitlements ==="
 codesign -f -s - "$FRAMEWORKS_PATH/QuantumultXAPNs.dylib"
+codesign -f -s - --entitlements "$DIR/tunnel.entitlements" "$TUNNEL_APPEX"
 codesign -f -s - --entitlements "$DIR/app.entitlements" "$APP_PATH"
 
-echo "=== 7. Packaging patched IPA ==="
+echo "=== 8. Packaging patched IPA ==="
 cd "$BUILD_TMP"
 zip -qry "$OUTPUT_IPA" Payload
 
