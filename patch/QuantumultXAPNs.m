@@ -433,11 +433,10 @@ static __unsafe_unretained id currentMoreSettingsVC = nil;
     BOOL apnsEnabled = [self isAPNsEnabled];
     NSLog(@"[QX_APNs] applyAPNsRoutingToProtocol: apnsEnabled = %d", (int)apnsEnabled);
 
-    // 1. includeAllNetworks: MUST be YES when APNs is enabled!
-    // In iOS NetworkExtension, excludeAPNs ONLY works when includeAllNetworks is YES.
+    // 1. includeAllNetworks: NO (Matching Stash architecture; keeps kernel packet filter from blocking physical en0 socket binding)
     if ([protocol respondsToSelector:@selector(setIncludeAllNetworks:)]) {
-        ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, @selector(setIncludeAllNetworks:), apnsEnabled);
-        NSLog(@"[QX_APNs] protocol.includeAllNetworks = %d", (int)apnsEnabled);
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, @selector(setIncludeAllNetworks:), NO);
+        NSLog(@"[QX_APNs] protocol.includeAllNetworks = NO");
     }
 
     // 2. excludeAPNs:
@@ -559,133 +558,6 @@ static void hook_moreSettings_viewDidLoad(id self, SEL _cmd) {
 }
 
 // -----------------------------------------------------------------------------
-// Hook 5: QTXInterfaceManager (strips interface binding for URL/ping checkers)
-// -----------------------------------------------------------------------------
-static NSString * (*orig_currentDefaultInterfaceName)(id self, SEL _cmd);
-static NSString * hook_currentDefaultInterfaceName(id self, SEL _cmd) {
-    if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
-        return nil;
-    }
-    return orig_currentDefaultInterfaceName ? orig_currentDefaultInterfaceName(self, _cmd) : nil;
-}
-
-static NSString * (*orig_defaultInterfaceName)(id self, SEL _cmd);
-static NSString * hook_defaultInterfaceName(id self, SEL _cmd) {
-    if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
-        return nil;
-    }
-    return orig_defaultInterfaceName ? orig_defaultInterfaceName(self, _cmd) : nil;
-}
-
-// -----------------------------------------------------------------------------
-// Hook 6: GCDAsyncSocket boundInterface setters
-// -----------------------------------------------------------------------------
-static void (*orig_containerAppBoundInterface)(id self, SEL _cmd, NSString *interface);
-static void hook_containerAppBoundInterface(id self, SEL _cmd, NSString *interface) {
-    if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
-        interface = nil;
-    }
-    if (orig_containerAppBoundInterface) {
-        orig_containerAppBoundInterface(self, _cmd, interface);
-    }
-}
-
-static void (*orig_boundInterface)(id self, SEL _cmd, NSString *interface);
-static void hook_boundInterface(id self, SEL _cmd, NSString *interface) {
-    if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
-        interface = nil;
-    }
-    if (orig_boundInterface) {
-        orig_boundInterface(self, _cmd, interface);
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Hook 7: GCDAsyncSocket connection methods (removes viaInterface argument)
-// -----------------------------------------------------------------------------
-static BOOL (*orig_connectToHost_viaInterface)(id self, SEL _cmd, NSString *host, uint16_t port, NSString *interface, double timeout, NSError **err);
-static BOOL hook_connectToHost_viaInterface(id self, SEL _cmd, NSString *host, uint16_t port, NSString *interface, double timeout, NSError **err) {
-    if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
-        interface = nil;
-    }
-    if (orig_connectToHost_viaInterface) {
-        return orig_connectToHost_viaInterface(self, _cmd, host, port, interface, timeout, err);
-    }
-    return NO;
-}
-
-static BOOL (*orig_concurrentConnect_viaInterface)(id self, SEL _cmd, NSArray *addresses, uint16_t port, NSString *interface, double timeout, NSError **err);
-static BOOL hook_concurrentConnect_viaInterface(id self, SEL _cmd, NSArray *addresses, uint16_t port, NSString *interface, double timeout, NSError **err) {
-    if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
-        interface = nil;
-    }
-    if (orig_concurrentConnect_viaInterface) {
-        return orig_concurrentConnect_viaInterface(self, _cmd, addresses, port, interface, timeout, err);
-    }
-    return NO;
-}
-
-static BOOL (*orig_crs_connectToHost)(id self, SEL _cmd, NSString *host, uint16_t port, NSString *interface, double timeout, NSError **err, id ip4, id ip6);
-static BOOL hook_crs_connectToHost(id self, SEL _cmd, NSString *host, uint16_t port, NSString *interface, double timeout, NSError **err, id ip4, id ip6) {
-    if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
-        interface = nil;
-    }
-    if (orig_crs_connectToHost) {
-        return orig_crs_connectToHost(self, _cmd, host, port, interface, timeout, err, ip4, ip6);
-    }
-    return NO;
-}
-
-static BOOL (*orig_connectToAddress_viaInterface)(id self, SEL _cmd, NSData *address, NSString *interface, double timeout, NSError **err);
-static BOOL hook_connectToAddress_viaInterface(id self, SEL _cmd, NSData *address, NSString *interface, double timeout, NSError **err) {
-    if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
-        interface = nil;
-    }
-    if (orig_connectToAddress_viaInterface) {
-        return orig_connectToAddress_viaInterface(self, _cmd, address, interface, timeout, err);
-    }
-    return NO;
-}
-
-static BOOL (*orig_preConnectWithInterface)(id self, SEL _cmd, NSString *interface, NSError **err);
-static BOOL hook_preConnectWithInterface(id self, SEL _cmd, NSString *interface, NSError **err) {
-    if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
-        interface = nil;
-    }
-    if (orig_preConnectWithInterface) {
-        return orig_preConnectWithInterface(self, _cmd, interface, err);
-    }
-    return NO;
-}
-
-static BOOL (*orig_crs_preConnectWithInterface)(id self, SEL _cmd, NSString *interface, NSError **err, id ip4, id ip6);
-static BOOL hook_crs_preConnectWithInterface(id self, SEL _cmd, NSString *interface, NSError **err, id ip4, id ip6) {
-    if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
-        interface = nil;
-    }
-    if (orig_crs_preConnectWithInterface) {
-        return orig_crs_preConnectWithInterface(self, _cmd, interface, err, ip4, ip6);
-    }
-    return NO;
-}
-
-// -----------------------------------------------------------------------------
-// Hook 8: GCDAsyncSocket createSocket:connectInterface:boundInterface:errPtr:
-// Ensures NO socket created by GCDAsyncSocket ever invokes IP_BOUND_IF on en0.
-// -----------------------------------------------------------------------------
-static int (*orig_createSocket_connectInterface_boundInterface_errPtr)(id self, SEL _cmd, int socketType, NSString *connectInterface, NSString *boundInterface, NSError **errPtr);
-static int hook_createSocket_connectInterface_boundInterface_errPtr(id self, SEL _cmd, int socketType, NSString *connectInterface, NSString *boundInterface, NSError **errPtr) {
-    if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
-        connectInterface = nil;
-        boundInterface = nil;
-    }
-    if (orig_createSocket_connectInterface_boundInterface_errPtr) {
-        return orig_createSocket_connectInterface_boundInterface_errPtr(self, _cmd, socketType, connectInterface, boundInterface, errPtr);
-    }
-    return -1;
-}
-
-// -----------------------------------------------------------------------------
 // Constructor
 // -----------------------------------------------------------------------------
 __attribute__((constructor))
@@ -734,103 +606,7 @@ static void initialize_quantumultx_apns_patch(void) {
         }
     }
 
-    // 4. Hook QTXInterfaceManager
-    Class ifMgrClass = objc_getClass("QTXInterfaceManager");
-    if (ifMgrClass) {
-        SEL selCurrDef = sel_registerName("currentDefaultInterfaceName");
-        Method mCurrDef = class_getInstanceMethod(ifMgrClass, selCurrDef);
-        if (mCurrDef) {
-            orig_currentDefaultInterfaceName = (void *)method_getImplementation(mCurrDef);
-            method_setImplementation(mCurrDef, (IMP)hook_currentDefaultInterfaceName);
-            NSLog(@"[QX_APNs] Hooked QTXInterfaceManager currentDefaultInterfaceName");
-        }
-
-        SEL selDef = sel_registerName("defaultInterfaceName");
-        Method mDef = class_getInstanceMethod(ifMgrClass, selDef);
-        if (mDef) {
-            orig_defaultInterfaceName = (void *)method_getImplementation(mDef);
-            method_setImplementation(mDef, (IMP)hook_defaultInterfaceName);
-            NSLog(@"[QX_APNs] Hooked QTXInterfaceManager defaultInterfaceName");
-        }
-    }
-
-    // 5. Hook GCDAsyncSocket
-    Class socketClass = objc_getClass("GCDAsyncSocket");
-    if (socketClass) {
-        SEL selCont = sel_registerName("containerAppBoundInterface:");
-        Method mCont = class_getInstanceMethod(socketClass, selCont);
-        if (mCont) {
-            orig_containerAppBoundInterface = (void *)method_getImplementation(mCont);
-            method_setImplementation(mCont, (IMP)hook_containerAppBoundInterface);
-            NSLog(@"[QX_APNs] Hooked GCDAsyncSocket containerAppBoundInterface:");
-        }
-
-        SEL selBound = sel_registerName("boundInterface:");
-        Method mBound = class_getInstanceMethod(socketClass, selBound);
-        if (mBound) {
-            orig_boundInterface = (void *)method_getImplementation(mBound);
-            method_setImplementation(mBound, (IMP)hook_boundInterface);
-            NSLog(@"[QX_APNs] Hooked GCDAsyncSocket boundInterface:");
-        }
-
-        SEL selConnHost = sel_registerName("connectToHost:onPort:viaInterface:withTimeout:error:");
-        Method mConnHost = class_getInstanceMethod(socketClass, selConnHost);
-        if (mConnHost) {
-            orig_connectToHost_viaInterface = (void *)method_getImplementation(mConnHost);
-            method_setImplementation(mConnHost, (IMP)hook_connectToHost_viaInterface);
-            NSLog(@"[QX_APNs] Hooked GCDAsyncSocket connectToHost:onPort:viaInterface:withTimeout:error:");
-        }
-
-        SEL selConcConn = sel_registerName("concurrentConnectToIPAddresses:onPort:viaInterface:withTimeout:error:");
-        Method mConcConn = class_getInstanceMethod(socketClass, selConcConn);
-        if (mConcConn) {
-            orig_concurrentConnect_viaInterface = (void *)method_getImplementation(mConcConn);
-            method_setImplementation(mConcConn, (IMP)hook_concurrentConnect_viaInterface);
-            NSLog(@"[QX_APNs] Hooked GCDAsyncSocket concurrentConnectToIPAddresses:onPort:viaInterface:withTimeout:error:");
-        }
-
-        SEL selCrsConn = sel_registerName("crs_connectToHost:onPort:viaInterface:withTimeout:error:ipv4Address:ipv6Address:");
-        Method mCrsConn = class_getInstanceMethod(socketClass, selCrsConn);
-        if (mCrsConn) {
-            orig_crs_connectToHost = (void *)method_getImplementation(mCrsConn);
-            method_setImplementation(mCrsConn, (IMP)hook_crs_connectToHost);
-            NSLog(@"[QX_APNs] Hooked GCDAsyncSocket crs_connectToHost:onPort:viaInterface:withTimeout:error:ipv4Address:ipv6Address:");
-        }
-
-        SEL selConnAddr = sel_registerName("connectToAddress:viaInterface:withTimeout:error:");
-        Method mConnAddr = class_getInstanceMethod(socketClass, selConnAddr);
-        if (mConnAddr) {
-            orig_connectToAddress_viaInterface = (void *)method_getImplementation(mConnAddr);
-            method_setImplementation(mConnAddr, (IMP)hook_connectToAddress_viaInterface);
-            NSLog(@"[QX_APNs] Hooked GCDAsyncSocket connectToAddress:viaInterface:withTimeout:error:");
-        }
-
-        SEL selPreConn = sel_registerName("preConnectWithInterface:error:");
-        Method mPreConn = class_getInstanceMethod(socketClass, selPreConn);
-        if (mPreConn) {
-            orig_preConnectWithInterface = (void *)method_getImplementation(mPreConn);
-            method_setImplementation(mPreConn, (IMP)hook_preConnectWithInterface);
-            NSLog(@"[QX_APNs] Hooked GCDAsyncSocket preConnectWithInterface:error:");
-        }
-
-        SEL selCrsPre = sel_registerName("crs_preConnectWithInterface:error:ipv4Address:ipv6Address:");
-        Method mCrsPre = class_getInstanceMethod(socketClass, selCrsPre);
-        if (mCrsPre) {
-            orig_crs_preConnectWithInterface = (void *)method_getImplementation(mCrsPre);
-            method_setImplementation(mCrsPre, (IMP)hook_crs_preConnectWithInterface);
-            NSLog(@"[QX_APNs] Hooked GCDAsyncSocket crs_preConnectWithInterface:error:ipv4Address:ipv6Address:");
-        }
-
-        SEL selCreateSock = sel_registerName("createSocket:connectInterface:boundInterface:errPtr:");
-        Method mCreateSock = class_getInstanceMethod(socketClass, selCreateSock);
-        if (mCreateSock) {
-            orig_createSocket_connectInterface_boundInterface_errPtr = (void *)method_getImplementation(mCreateSock);
-            method_setImplementation(mCreateSock, (IMP)hook_createSocket_connectInterface_boundInterface_errPtr);
-            NSLog(@"[QX_APNs] Hooked GCDAsyncSocket createSocket:connectInterface:boundInterface:errPtr:");
-        }
-    }
-
-    // 6. Update and sanitize existing preferences on startup
+    // 4. Update and sanitize existing preferences on startup
     dispatch_async(dispatch_get_main_queue(), ^{
         [[QuantumultXAPNsManager sharedManager] updateAndSavePreferences];
     });
