@@ -27,21 +27,20 @@ def patch_tunnel_binary(tunnel_path):
             print(f"[patch_tunnel] Unexpected instruction at {hex(offset)}: {current_bytes.hex()}. Aborting!")
             sys.exit(1)
 
-        # Patch 2: Disable sleepWithCompletionHandler: so iOS never suspends the tunnel on lock screen (matching Stash behavior)
-        # Selector string at 0x57afab in __TEXT, __objc_methname:
-        # Original: "sleepWithCompletionHandler:\0"
-        # Patched:  "_leepWithCompletionHandler:\0"
+        # Restore sleepWithCompletionHandler: if previously renamed
+        # -[QTXPacketTunnelProvider sleepWithCompletionHandler:] schedules fire dates
+        # which must remain intact for clean sleep/wake cycle handling.
         str_offset = 0x57afab
         f.seek(str_offset)
         curr_str = f.read(28)
-        if curr_str == b"sleepWithCompletionHandler:\x00":
+        if curr_str == b"_leepWithCompletionHandler:\x00":
             f.seek(str_offset)
-            f.write(b"_leepWithCompletionHandler:\x00")
-            print(f"[patch_tunnel] Successfully disabled sleepWithCompletionHandler: (tunnel runs continuously 24/7 like Stash)")
-        elif curr_str == b"_leepWithCompletionHandler:\x00":
-            print(f"[patch_tunnel] sleepWithCompletionHandler: already disabled.")
+            f.write(b"sleepWithCompletionHandler:\x00")
+            print(f"[patch_tunnel] Restored sleepWithCompletionHandler: for clean sleep/wake handling.")
+        elif curr_str == b"sleepWithCompletionHandler:\x00":
+            print(f"[patch_tunnel] sleepWithCompletionHandler: intact.")
         else:
-            print(f"[patch_tunnel] Warning: Unexpected selector string at {hex(str_offset)}: {curr_str}")
+            print(f"[patch_tunnel] Notice: Selector string at {hex(str_offset)}: {curr_str}")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

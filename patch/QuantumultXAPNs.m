@@ -221,17 +221,57 @@ static NSData *generateSilentWAVData(void) {
     [wav appendBytes:"data" length:4];
     [wav appendBytes:&dataSize length:4];
 
-    // Minimal dither: alternating +/-1 sample value (-90 dBFS, completely inaudible,
-    // but ensures iOS mediaserverd actively processes non-zero PCM and never marks audio as idle).
-    int16_t *samples = (int16_t *)malloc(dataSize);
-    if (samples) {
-        for (size_t i = 0; i < numSamples; i++) {
-            samples[i] = (i % 2 == 0) ? 1 : -1;
-        }
-        [wav appendBytes:samples length:dataSize];
-        free(samples);
+    // Clean, perfect silent PCM buffer (all zeroes)
+    void *silence = calloc(1, dataSize);
+    if (silence) {
+        [wav appendBytes:silence length:dataSize];
+        free(silence);
     }
     return wav;
+}
+
+static void activateAudioSessionAndPlay(void) {
+    @try {
+        Class sessionClass = objc_getClass("AVAudioSession");
+        if (sessionClass) {
+            id session = ((id (*)(id, SEL))objc_msgSend)(sessionClass, sel_registerName("sharedInstance"));
+            if (session) {
+                // AVAudioSessionCategoryOptionMixWithOthers = 1 (Never ducks, never interrupts other audio)
+                NSUInteger options = 1;
+                ((BOOL (*)(id, SEL, id, NSUInteger, id*))objc_msgSend)(session, sel_registerName("setCategory:withOptions:error:"), @"AVAudioSessionCategoryPlayback", options, NULL);
+                ((BOOL (*)(id, SEL, BOOL, id*))objc_msgSend)(session, sel_registerName("setActive:error:"), YES, NULL);
+            }
+        }
+
+        if (!s_silentAudioPlayer) {
+            Class playerClass = objc_getClass("AVAudioPlayer");
+            if (playerClass) {
+                NSData *wavData = generateSilentWAVData();
+                id player = [playerClass alloc];
+                player = ((id (*)(id, SEL, id, id*))objc_msgSend)(player, sel_registerName("initWithData:error:"), wavData, NULL);
+                if (player) {
+                    ((void (*)(id, SEL, NSInteger))objc_msgSend)(player, sel_registerName("setNumberOfLoops:"), -1); // Infinite loop
+                    ((void (*)(id, SEL, float))objc_msgSend)(player, sel_registerName("setVolume:"), 0.0f); // Pure zero volume
+                    ((BOOL (*)(id, SEL))objc_msgSend)(player, sel_registerName("prepareToPlay"));
+                    BOOL ok = ((BOOL (*)(id, SEL))objc_msgSend)(player, sel_registerName("play"));
+                    s_silentAudioPlayer = player;
+                    NSLog(@"[QX_APNs] Silent background audio started, play = %d", (int)ok);
+                }
+            }
+        } else {
+            SEL selIsPlaying = sel_registerName("isPlaying");
+            if ([s_silentAudioPlayer respondsToSelector:selIsPlaying]) {
+                BOOL playing = ((BOOL (*)(id, SEL))objc_msgSend)(s_silentAudioPlayer, selIsPlaying);
+                if (!playing) {
+                    SEL selPlay = sel_registerName("play");
+                    BOOL ok = ((BOOL (*)(id, SEL))objc_msgSend)(s_silentAudioPlayer, selPlay);
+                    NSLog(@"[QX_APNs] Silent background audio resumed, play = %d", (int)ok);
+                }
+            }
+        }
+    } @catch (NSException *e) {
+        NSLog(@"[QX_APNs] activateAudioSessionAndPlay error: %@", e);
+    }
 }
 
 - (void)startBackgroundKeepaliveEngine {
@@ -240,54 +280,11 @@ static NSData *generateSilentWAVData(void) {
         return;
     }
 
-    // 1. Setup AVAudioSession with CategoryPlayback + MixWithOthers (inaudible, non-interruptive)
-    @try {
-        Class sessionClass = objc_getClass("AVAudioSession");
-        if (sessionClass) {
-            id session = ((id (*)(id, SEL))objc_msgSend)(sessionClass, sel_registerName("sharedInstance"));
-            if (session) {
-                // AVAudioSessionCategoryOptionMixWithOthers = 1, AVAudioSessionCategoryOptionDuckOthers = 2
-                NSUInteger options = 1 | 2;
-                ((BOOL (*)(id, SEL, id, NSUInteger, id*))objc_msgSend)(session, sel_registerName("setCategory:withOptions:error:"), @"AVAudioSessionCategoryPlayback", options, NULL);
-                ((BOOL (*)(id, SEL, BOOL, id*))objc_msgSend)(session, sel_registerName("setActive:error:"), YES, NULL);
-            }
-        }
-    } @catch (NSException *e) {
-        NSLog(@"[QX_APNs] AudioSession setup error: %@", e);
-    }
+    // 1. Activate audio session & silent player for continuous lockscreen background execution
+    activateAudioSessionAndPlay();
 
-    // 2. Play looping audio with 0.0001f volume so iOS never suspends Quantumult X on lock screen
-    if (!s_silentAudioPlayer) {
-        @try {
-            Class playerClass = objc_getClass("AVAudioPlayer");
-            if (playerClass) {
-                NSData *wavData = generateSilentWAVData();
-                id player = [playerClass alloc];
-                player = ((id (*)(id, SEL, id, id*))objc_msgSend)(player, sel_registerName("initWithData:error:"), wavData, NULL);
-                if (player) {
-                    ((void (*)(id, SEL, NSInteger))objc_msgSend)(player, sel_registerName("setNumberOfLoops:"), -1); // Infinite
-                    ((void (*)(id, SEL, float))objc_msgSend)(player, sel_registerName("setVolume:"), 0.0001f); // Micro-volume for mediaserverd keepalive
-                    ((BOOL (*)(id, SEL))objc_msgSend)(player, sel_registerName("play"));
-                    s_silentAudioPlayer = player;
-                    NSLog(@"[QX_APNs] Silent background audio playback active.");
-                }
-            }
-        } @catch (NSException *e) {
-            NSLog(@"[QX_APNs] AudioPlayer init error: %@", e);
-        }
-    } else {
-        SEL selIsPlaying = sel_registerName("isPlaying");
-        if ([s_silentAudioPlayer respondsToSelector:selIsPlaying]) {
-            BOOL playing = ((BOOL (*)(id, SEL))objc_msgSend)(s_silentAudioPlayer, selIsPlaying);
-            if (!playing) {
-                SEL selPlay = sel_registerName("play");
-                ((BOOL (*)(id, SEL))objc_msgSend)(s_silentAudioPlayer, selPlay);
-            }
-        }
-    }
-
-    // 3. Periodic Keepalive Probe Timer (15 seconds interval)
-    // Carrier NAT timeout is 60-120 seconds. 15 seconds guarantees 100% NAT persistence!
+    // 2. Periodic Keepalive Probe Timer (15 seconds interval)
+    // Cellular carrier NAT table timeout is 30-120 seconds. 15 seconds guarantees 100% NAT persistence!
     if (!s_keepaliveTimer) {
         dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0);
         s_keepaliveTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
@@ -295,45 +292,17 @@ static NSData *generateSilentWAVData(void) {
             dispatch_source_set_timer(s_keepaliveTimer, dispatch_time(DISPATCH_TIME_NOW, 0), 15 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
             dispatch_source_set_event_handler(s_keepaliveTimer, ^{
                 // Check & revive audio player if paused
-                if (s_silentAudioPlayer) {
-                    SEL selIsPlaying = sel_registerName("isPlaying");
-                    if ([s_silentAudioPlayer respondsToSelector:selIsPlaying]) {
-                        BOOL playing = ((BOOL (*)(id, SEL))objc_msgSend)(s_silentAudioPlayer, selIsPlaying);
-                        if (!playing) {
-                            SEL selPlay = sel_registerName("play");
-                            ((BOOL (*)(id, SEL))objc_msgSend)(s_silentAudioPlayer, selPlay);
-                        }
-                    }
-                }
+                activateAudioSessionAndPlay();
 
-                // A. Instant UDP DNS probe to 1.1.1.1:53 (17 bytes, zero DNS delay, forces tunnel keepalive)
-                dispatch_async(queue, ^{
-                    static const uint8_t s_dnsProbe[] = {
-                        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
-                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01
-                    };
-                    int s = socket(AF_INET, SOCK_DGRAM, 0);
-                    if (s >= 0) {
-                        struct sockaddr_in sin;
-                        memset(&sin, 0, sizeof(sin));
-                        sin.sin_len = sizeof(sin);
-                        sin.sin_family = AF_INET;
-                        sin.sin_port = htons(53);
-                        inet_pton(AF_INET, "1.1.1.1", &sin.sin_addr);
-                        sendto(s, s_dnsProbe, sizeof(s_dnsProbe), 0, (struct sockaddr *)&sin, sizeof(sin));
-                        close(s);
-                    }
-                });
-
-                // B. Apple CDN HTTP HEAD (69 bytes) to refresh cellular tunnel NAT mapping
+                // A. Apple CDN HTTP HEAD (69 bytes) to refresh tunnel NAT mapping
                 NSURL *url = [NSURL URLWithString:@"http://captive.apple.com/hotspot-detect.html"];
                 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:4.0];
                 req.HTTPMethod = @"HEAD";
                 [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *err) {
-                    // Packet successfully traveled through tunnel
+                    // Packet traveled through tunnel, NAT refreshed
                 }] resume];
 
-                // C. Non-blocking TCP probe to courier.push.apple.com:5223 to keep Apple APNs path warm
+                // B. Non-blocking TCP probe to courier.push.apple.com:5223 to keep APNs path warm
                 dispatch_async(queue, ^{
                     struct addrinfo hints, *res;
                     memset(&hints, 0, sizeof(hints));
@@ -717,19 +686,20 @@ static NSData *generateSilentWAVData(void) {
         NSLog(@"[QX_APNs] protocol.excludeAPNs = %d", (int)excludeAPNs);
     }
 
-    // 3. excludeLocalNetworks: NO (keeps natural routing)
+    // 3. excludeLocalNetworks: YES
+    // Prevents local router ARP & DHCP from getting captured into tunnel, keeping Wi-Fi alive during sleep!
     SEL selExcludeLocal = sel_registerName("setExcludeLocalNetworks:");
     if ([protocol respondsToSelector:selExcludeLocal]) {
-        ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, selExcludeLocal, NO);
-        NSLog(@"[QX_APNs] protocol.excludeLocalNetworks = NO");
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, selExcludeLocal, YES);
+        NSLog(@"[QX_APNs] protocol.excludeLocalNetworks = YES");
     }
 
-    // 4. excludeCellularServices: Explicitly NO!
-    // Ensures cellular internet works immediately without needing to switch servers!
+    // 4. excludeCellularServices: YES
+    // Keeps carrier IMS / VoLTE / baseband paging alive so carrier can page the phone during lockscreen sleep!
     SEL selExcludeCell = sel_registerName("setExcludeCellularServices:");
     if ([protocol respondsToSelector:selExcludeCell]) {
-        ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, selExcludeCell, NO);
-        NSLog(@"[QX_APNs] protocol.excludeCellularServices = NO");
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, selExcludeCell, YES);
+        NSLog(@"[QX_APNs] protocol.excludeCellularServices = YES");
     }
 
     // 5. enforceRoutes: Explicitly NO!
@@ -1007,6 +977,16 @@ static void initialize_quantumultx_apns_patch(void) {
     });
 
     // 6. Listen for app lifecycle, audio interruptions & route changes to maintain continuous keepalive
+    [[NSNotificationCenter defaultCenter] addObserverForName:@"UIApplicationDidFinishLaunchingNotification"
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification *note) {
+        [[QuantumultXAPNsManager sharedManager] updateAndSavePreferences];
+        if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
+            [[QuantumultXAPNsManager sharedManager] startBackgroundKeepaliveEngine];
+        }
+    }];
+
     [[NSNotificationCenter defaultCenter] addObserverForName:@"UIApplicationDidBecomeActiveNotification"
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
