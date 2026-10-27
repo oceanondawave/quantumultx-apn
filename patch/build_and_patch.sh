@@ -12,9 +12,15 @@ clang -dynamiclib -target arm64-apple-ios14.0 \
   -Wl,-undefined,dynamic_lookup \
   -install_name "@executable_path/Frameworks/QuantumultXAPNs.dylib" \
   "$DIR/QuantumultXAPNs.m" -o "$DIR/QuantumultXAPNs.dylib"
-
-echo "=== 2. Ad-hoc signing QuantumultXAPNs.dylib ==="
 codesign -f -s - "$DIR/QuantumultXAPNs.dylib"
+
+echo "=== 2. Compiling QuantumultXTunnelKeepalive.dylib for Tunnel Extension ==="
+clang -dynamiclib -target arm64-apple-ios14.0 \
+  -Wl,-undefined,dynamic_lookup \
+  -install_name "@executable_path/QuantumultXTunnelKeepalive.dylib" \
+  "$DIR/fishhook.c" "$DIR/QuantumultXTunnelKeepalive.m" \
+  -o "$DIR/QuantumultXTunnelKeepalive.dylib"
+codesign -f -s - "$DIR/QuantumultXTunnelKeepalive.dylib"
 
 echo "=== 3. Extracting original IPA ==="
 rm -rf "$BUILD_TMP"
@@ -31,13 +37,17 @@ cp "$DIR/QuantumultXAPNs.dylib" "$FRAMEWORKS_PATH/QuantumultXAPNs.dylib"
 echo "=== 5. Injecting LC_LOAD_DYLIB into Mach-O ==="
 python3 "$DIR/inject_dylib.py" "$APP_PATH/Quantumult X" "@executable_path/Frameworks/QuantumultXAPNs.dylib" "$APP_PATH/Quantumult X"
 
-echo "=== 6. Patching Quantumult X Tunnel binary (permanent APNs keepalive) ==="
+echo "=== 6. Patching Quantumult X Tunnel binary & Injecting Keepalive Dylib ==="
 TUNNEL_APPEX="$APP_PATH/PlugIns/Quantumult X Tunnel.appex"
 TUNNEL_BIN="$TUNNEL_APPEX/Quantumult X Tunnel"
 python3 "$DIR/patch_tunnel.py" "$TUNNEL_BIN"
 
+cp "$DIR/QuantumultXTunnelKeepalive.dylib" "$TUNNEL_APPEX/QuantumultXTunnelKeepalive.dylib"
+python3 "$DIR/inject_dylib.py" "$TUNNEL_BIN" "@executable_path/QuantumultXTunnelKeepalive.dylib" "$TUNNEL_BIN"
+
 echo "=== 7. Re-signing Tunnel Extension and App with Original Entitlements ==="
 codesign -f -s - "$FRAMEWORKS_PATH/QuantumultXAPNs.dylib"
+codesign -f -s - "$TUNNEL_APPEX/QuantumultXTunnelKeepalive.dylib"
 codesign -f -s - --entitlements "$DIR/tunnel.entitlements" "$TUNNEL_APPEX"
 codesign -f -s - --entitlements "$DIR/app.entitlements" "$APP_PATH"
 
