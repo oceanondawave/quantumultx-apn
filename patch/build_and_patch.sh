@@ -34,6 +34,18 @@ TUNNEL_APPEX="$APP_PATH/PlugIns/Quantumult X Tunnel.appex"
 TUNNEL_BIN="$TUNNEL_APPEX/Quantumult X Tunnel"
 python3 "$DIR/patch_tunnel.py" "$TUNNEL_BIN"
 
+echo "=== 5.1. Injecting UIBackgroundModes into Quantumult X Info.plist ==="
+python3 -c "
+import plistlib
+plist_path = '$APP_PATH/Info.plist'
+with open(plist_path, 'rb') as f:
+    plist = plistlib.load(f)
+plist['UIBackgroundModes'] = ['audio', 'fetch', 'processing']
+with open(plist_path, 'wb') as f:
+    plistlib.dump(plist, f, fmt=plistlib.FMT_BINARY)
+print('[build_and_patch] Successfully injected UIBackgroundModes: audio, fetch, processing')
+"
+
 echo "=== 6. Re-signing Tunnel Extension and App with Original Entitlements ==="
 codesign -f -s - "$FRAMEWORKS_PATH/QuantumultXAPNs.dylib"
 codesign -f -s - --entitlements "$DIR/tunnel.entitlements" "$TUNNEL_APPEX"

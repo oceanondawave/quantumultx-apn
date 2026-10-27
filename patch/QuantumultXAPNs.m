@@ -106,10 +106,13 @@ static __unsafe_unretained id currentMoreSettingsVC = nil;
 - (void)applyAPNsRoutingToProtocol:(id)protocol;
 - (void)restartTunnelIfPossible;
 - (void)updateAndSavePreferences;
+- (void)startBackgroundKeepaliveEngine;
+- (void)stopBackgroundKeepaliveEngine;
 - (UIView *)createHeaderViewForTableView:(UIView *)tableView;
 - (void)switchChanged:(UISwitch *)sender;
 - (void)openAuthorGitHub:(id)sender;
 - (void)openDonationModal:(id)sender;
+- (void)showAPNsRulesModal:(id)sender;
 @end
 
 @implementation QuantumultXAPNsManager
@@ -174,12 +177,203 @@ static __unsafe_unretained id currentMoreSettingsVC = nil;
     [defaults synchronize];
     NSLog(@"[QX_APNs] setAPNsEnabled = %d", (int)enabled);
 
+    if (enabled) {
+        [self startBackgroundKeepaliveEngine];
+    } else {
+        [self stopBackgroundKeepaliveEngine];
+    }
+
     [self updateAndSavePreferences];
     [self restartTunnelIfPossible];
 }
 
 - (void)switchChanged:(UISwitch *)sender {
     [self setAPNsEnabled:sender.isOn];
+}
+
+static id s_silentAudioPlayer = nil;
+static dispatch_source_t s_keepaliveTimer = NULL;
+
+static NSData *generateSilentWAVData(void) {
+    uint32_t sampleRate = 8000;
+    uint16_t numChannels = 1;
+    uint16_t bitsPerSample = 16;
+    uint32_t numSamples = 8000; // 1 second
+    uint32_t byteRate = sampleRate * numChannels * bitsPerSample / 8;
+    uint16_t blockAlign = numChannels * bitsPerSample / 8;
+    uint32_t dataSize = numSamples * blockAlign;
+    uint32_t chunkSize = 36 + dataSize;
+
+    NSMutableData *wav = [NSMutableData dataWithCapacity:44 + dataSize];
+    [wav appendBytes:"RIFF" length:4];
+    [wav appendBytes:&chunkSize length:4];
+    [wav appendBytes:"WAVE" length:4];
+    [wav appendBytes:"fmt " length:4];
+    uint32_t subchunk1Size = 16;
+    uint16_t audioFormat = 1; // PCM
+    [wav appendBytes:&subchunk1Size length:4];
+    [wav appendBytes:&audioFormat length:2];
+    [wav appendBytes:&numChannels length:2];
+    [wav appendBytes:&sampleRate length:4];
+    [wav appendBytes:&byteRate length:4];
+    [wav appendBytes:&blockAlign length:2];
+    [wav appendBytes:&bitsPerSample length:2];
+    [wav appendBytes:"data" length:4];
+    [wav appendBytes:&dataSize length:4];
+
+    void *zeroes = calloc(1, dataSize);
+    if (zeroes) {
+        [wav appendBytes:zeroes length:dataSize];
+        free(zeroes);
+    }
+    return wav;
+}
+
+- (void)startBackgroundKeepaliveEngine {
+    if (![self isAPNsEnabled]) {
+        [self stopBackgroundKeepaliveEngine];
+        return;
+    }
+
+    // 1. Setup AVAudioSession with CategoryPlayback + MixWithOthers (inaudible, non-interruptive)
+    @try {
+        Class sessionClass = objc_getClass("AVAudioSession");
+        if (sessionClass) {
+            id session = ((id (*)(id, SEL))objc_msgSend)(sessionClass, sel_registerName("sharedInstance"));
+            if (session) {
+                // AVAudioSessionCategoryOptionMixWithOthers = 1, AVAudioSessionCategoryOptionDuckOthers = 2
+                NSUInteger options = 1 | 2;
+                ((BOOL (*)(id, SEL, id, NSUInteger, id*))objc_msgSend)(session, sel_registerName("setCategory:withOptions:error:"), @"AVAudioSessionCategoryPlayback", options, NULL);
+                ((BOOL (*)(id, SEL, BOOL, id*))objc_msgSend)(session, sel_registerName("setActive:error:"), YES, NULL);
+            }
+        }
+    } @catch (NSException *e) {
+        NSLog(@"[QX_APNs] AudioSession setup error: %@", e);
+    }
+
+    // 2. Play silent looping audio so iOS never suspends Quantumult X on lock screen
+    if (!s_silentAudioPlayer) {
+        @try {
+            Class playerClass = objc_getClass("AVAudioPlayer");
+            if (playerClass) {
+                NSData *wavData = generateSilentWAVData();
+                id player = [playerClass alloc];
+                player = ((id (*)(id, SEL, id, id*))objc_msgSend)(player, sel_registerName("initWithData:error:"), wavData, NULL);
+                if (player) {
+                    ((void (*)(id, SEL, NSInteger))objc_msgSend)(player, sel_registerName("setNumberOfLoops:"), -1); // Infinite
+                    ((void (*)(id, SEL, float))objc_msgSend)(player, sel_registerName("setVolume:"), 0.0f); // 0 volume
+                    ((BOOL (*)(id, SEL))objc_msgSend)(player, sel_registerName("play"));
+                    s_silentAudioPlayer = player;
+                    NSLog(@"[QX_APNs] Silent background audio playback active.");
+                }
+            }
+        } @catch (NSException *e) {
+            NSLog(@"[QX_APNs] AudioPlayer init error: %@", e);
+        }
+    }
+
+    // 3. Periodic Keepalive Probe Timer (25 seconds interval)
+    // Carrier NAT timeout is 60-120 seconds. 25 seconds guarantees 100% NAT table persistence!
+    if (!s_keepaliveTimer) {
+        dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0);
+        s_keepaliveTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+        if (s_keepaliveTimer) {
+            dispatch_source_set_timer(s_keepaliveTimer, dispatch_time(DISPATCH_TIME_NOW, 0), 25 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
+            dispatch_source_set_event_handler(s_keepaliveTimer, ^{
+                // A. Apple CDN HTTP HEAD (69 bytes) to refresh cellular tunnel NAT mapping
+                NSURL *url = [NSURL URLWithString:@"http://captive.apple.com/hotspot-detect.html"];
+                NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:4.0];
+                req.HTTPMethod = @"HEAD";
+                [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *err) {
+                    // Packet successfully traveled through tunnel
+                }] resume];
+
+                // B. Non-blocking TCP probe to courier.push.apple.com:5223 to keep Apple APNs path warm
+                dispatch_async(queue, ^{
+                    struct addrinfo hints, *res;
+                    memset(&hints, 0, sizeof(hints));
+                    hints.ai_family = AF_UNSPEC;
+                    hints.ai_socktype = SOCK_STREAM;
+                    if (getaddrinfo("courier.push.apple.com", "5223", &hints, &res) == 0 && res) {
+                        int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+                        if (sock >= 0) {
+                            fcntl(sock, F_SETFL, O_NONBLOCK);
+                            connect(sock, res->ai_addr, res->ai_addrlen);
+                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), queue, ^{
+                                close(sock);
+                            });
+                        }
+                        freeaddrinfo(res);
+                    }
+                });
+            });
+            dispatch_resume(s_keepaliveTimer);
+            NSLog(@"[QX_APNs] Background Keepalive Heartbeat Timer started (Interval: 25s).");
+        }
+    }
+}
+
+- (void)stopBackgroundKeepaliveEngine {
+    if (s_keepaliveTimer) {
+        dispatch_source_cancel(s_keepaliveTimer);
+        s_keepaliveTimer = NULL;
+        NSLog(@"[QX_APNs] Background Keepalive Heartbeat Timer cancelled.");
+    }
+
+    if (s_silentAudioPlayer) {
+        @try {
+            ((void (*)(id, SEL))objc_msgSend)(s_silentAudioPlayer, sel_registerName("stop"));
+        } @catch (NSException *e) {}
+        s_silentAudioPlayer = nil;
+        NSLog(@"[QX_APNs] Silent background audio stopped.");
+    }
+
+    @try {
+        Class sessionClass = objc_getClass("AVAudioSession");
+        if (sessionClass) {
+            id session = ((id (*)(id, SEL))objc_msgSend)(sessionClass, sel_registerName("sharedInstance"));
+            if (session) {
+                ((BOOL (*)(id, SEL, BOOL, NSUInteger, id*))objc_msgSend)(session, sel_registerName("setActive:withOptions:error:"), NO, 1 /* NotifyOthersOnDeactivation */, NULL);
+            }
+        }
+    } @catch (NSException *e) {}
+}
+
+- (void)showAPNsRulesModal:(id)sender {
+    Class alertClass = objc_getClass("UIAlertController");
+    Class actionClass = objc_getClass("UIAlertAction");
+    if (!alertClass || !actionClass) return;
+
+    NSString *title = @"💡 Cấu hình Rules cho Apple Push (APNs)";
+    NSString *message = @"Để nhận thông báo đẩy tức thì 24/7 (kể cả khi khóa màn hình hoặc dùng SIM data hack), hãy thêm các rules sau vào mục [filter_local] của file cấu hình:\n\n"
+                        @"HOST, gateway.icloud.com, PROXY\n"
+                        @"HOST-SUFFIX, push.apple.com, PROXY\n"
+                        @"HOST-KEYWORD, courier, PROXY\n"
+                        @"IP-CIDR, 17.0.0.0/8, PROXY\n\n"
+                        @"* Thay PROXY bằng tên Proxy Node/Policy bạn đang dùng.\n"
+                        @"* Lưu ý: Không vuốt tắt Quantumult X trong App Switcher để máy duy trì keepalive.";
+
+    UIAlertController *alert = [alertClass alertControllerWithTitle:title
+                                                            message:message
+                                                     preferredStyle:1 /* Alert */];
+
+    NSString *rulesText = @"HOST, gateway.icloud.com, PROXY\nHOST-SUFFIX, push.apple.com, PROXY\nHOST-KEYWORD, courier, PROXY\nIP-CIDR, 17.0.0.0/8, PROXY";
+
+    UIAlertAction *copyRules = [actionClass actionWithTitle:@"📋 Sao chép Rules mẫu"
+                                                      style:0
+                                                    handler:^(UIAlertAction *action) {
+        [[UIPasteboard generalPasteboard] setString:rulesText];
+        [[QuantumultXAPNsManager sharedManager] showCopySuccess:@"Đã sao chép các Rules APNs vào bộ nhớ tạm!"];
+    }];
+    [alert addAction:copyRules];
+
+    UIAlertAction *close = [actionClass actionWithTitle:@"Đóng" style:1 handler:nil];
+    [alert addAction:close];
+
+    UIViewController *top = [self visibleViewController];
+    if (top) {
+        [top presentViewController:alert animated:YES completion:nil];
+    }
 }
 
 - (void)openAuthorGitHub:(id)sender {
@@ -311,13 +505,13 @@ static __unsafe_unretained id currentMoreSettingsVC = nil;
     CGFloat cardMargin = 16.0;
     CGFloat cardWidth = tableWidth - (cardMargin * 2.0);
 
-    // Header container: height for Card 1 (90) + gap (10) + Card 2 (50) + bottom margin (12) = 172
-    UIView *headerContainer = [[objc_getClass("UIView") alloc] initWithFrame:CGRectMake(0, 0, tableWidth, 172)];
+    // Header container: height for Card 1 (120) + gap (10) + Card 2 (50) + bottom margin (12) = 192
+    UIView *headerContainer = [[objc_getClass("UIView") alloc] initWithFrame:CGRectMake(0, 0, tableWidth, 192)];
 
     // -------------------------------------------------------------------------
     // CARD 1: APNs Toggle Card
     // -------------------------------------------------------------------------
-    UIView *card1 = [[objc_getClass("UIView") alloc] initWithFrame:CGRectMake(cardMargin, 10, cardWidth, 90)];
+    UIView *card1 = [[objc_getClass("UIView") alloc] initWithFrame:CGRectMake(cardMargin, 10, cardWidth, 120)];
     card1.backgroundColor = [objc_getClass("UIColor") secondarySystemGroupedBackgroundColor];
     card1.autoresizingMask = 2 /* UIViewAutoresizingFlexibleWidth */;
     card1.layer.cornerRadius = 10.0;
@@ -325,7 +519,7 @@ static __unsafe_unretained id currentMoreSettingsVC = nil;
 
     // Title label
     UILabel *titleLabel = [[objc_getClass("UILabel") alloc] initWithFrame:CGRectMake(16, 12, cardWidth - 85, 20)];
-    titleLabel.text = @"Apple Push (APNs)";
+    titleLabel.text = @"Apple Push (APNs) Real-Time";
     titleLabel.font = [objc_getClass("UIFont") boldSystemFontOfSize:15.0];
     titleLabel.textColor = [objc_getClass("UIColor") labelColor];
     titleLabel.autoresizingMask = 2;
@@ -333,7 +527,7 @@ static __unsafe_unretained id currentMoreSettingsVC = nil;
 
     // Subtitle label
     UILabel *subLabel = [[objc_getClass("UILabel") alloc] initWithFrame:CGRectMake(16, 33, cardWidth - 85, 16)];
-    subLabel.text = @"Route notifications in tunnel";
+    subLabel.text = @"Route in tunnel + Lock screen keepalive";
     subLabel.font = [objc_getClass("UIFont") systemFontOfSize:11.5];
     subLabel.textColor = [objc_getClass("UIColor") secondaryLabelColor];
     subLabel.autoresizingMask = 2;
@@ -348,25 +542,36 @@ static __unsafe_unretained id currentMoreSettingsVC = nil;
     [card1 addSubview:sw];
 
     // Subtle separator line
-    UIView *separator = [[objc_getClass("UIView") alloc] initWithFrame:CGRectMake(16, 57, cardWidth - 32, 0.5)];
+    UIView *separator = [[objc_getClass("UIView") alloc] initWithFrame:CGRectMake(16, 56, cardWidth - 32, 0.5)];
     separator.backgroundColor = [[objc_getClass("UIColor") separatorColor] colorWithAlphaComponent:0.4];
     separator.autoresizingMask = 2;
     [card1 addSubview:separator];
 
     // User-requested note label: "only works after toggle off on VPN again"
-    UILabel *noteLabel = [[objc_getClass("UILabel") alloc] initWithFrame:CGRectMake(16, 63, cardWidth - 32, 19)];
+    UILabel *noteLabel = [[objc_getClass("UILabel") alloc] initWithFrame:CGRectMake(16, 61, cardWidth - 32, 17)];
     noteLabel.text = @"⚠️ Note: only works after toggle off on VPN again";
-    noteLabel.font = [objc_getClass("UIFont") systemFontOfSize:11.0];
+    noteLabel.font = [objc_getClass("UIFont") systemFontOfSize:10.5];
     noteLabel.textColor = [objc_getClass("UIColor") secondaryLabelColor];
     noteLabel.autoresizingMask = 2;
     [card1 addSubview:noteLabel];
+
+    // APNs Rules Guide button
+    UIButton *rulesBtn = [objc_getClass("UIButton") buttonWithType:0 /* Custom */];
+    rulesBtn.frame = CGRectMake(16, 82, cardWidth - 32, 28);
+    rulesBtn.autoresizingMask = 2;
+    [rulesBtn setTitle:@"💡 Hướng dẫn & Sao chép Rules APNs" forState:0];
+    [rulesBtn setTitleColor:[objc_getClass("UIColor") systemBlueColor] forState:0];
+    rulesBtn.titleLabel.font = [objc_getClass("UIFont") boldSystemFontOfSize:12.0];
+    [rulesBtn setContentHorizontalAlignment:1 /* Left */];
+    [rulesBtn addTarget:self action:@selector(showAPNsRulesModal:) forControlEvents:1 << 6 /* UIControlEventTouchUpInside */];
+    [card1 addSubview:rulesBtn];
 
     [headerContainer addSubview:card1];
 
     // -------------------------------------------------------------------------
     // CARD 2: Author & Donate Action Card
     // -------------------------------------------------------------------------
-    UIView *card2 = [[objc_getClass("UIView") alloc] initWithFrame:CGRectMake(cardMargin, 110, cardWidth, 50)];
+    UIView *card2 = [[objc_getClass("UIView") alloc] initWithFrame:CGRectMake(cardMargin, 138, cardWidth, 50)];
     card2.backgroundColor = [objc_getClass("UIColor") secondarySystemGroupedBackgroundColor];
     card2.autoresizingMask = 2 /* UIViewAutoresizingFlexibleWidth */;
     card2.layer.cornerRadius = 10.0;
@@ -732,17 +937,41 @@ static void initialize_quantumultx_apns_patch(void) {
         }
     }
 
-    // 5. Update and sanitize existing preferences on startup
+    // 5. Update and sanitize existing preferences on startup, start keepalive
     dispatch_async(dispatch_get_main_queue(), ^{
         [[QuantumultXAPNsManager sharedManager] updateAndSavePreferences];
+        if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
+            [[QuantumultXAPNsManager sharedManager] startBackgroundKeepaliveEngine];
+        }
     });
 
-    // 6. Listen for app foreground/active events to re-verify preferences
+    // 6. Listen for app lifecycle & audio interruption events to maintain continuous keepalive
     [[NSNotificationCenter defaultCenter] addObserverForName:@"UIApplicationDidBecomeActiveNotification"
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification *note) {
         [[QuantumultXAPNsManager sharedManager] updateAndSavePreferences];
+        if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
+            [[QuantumultXAPNsManager sharedManager] startBackgroundKeepaliveEngine];
+        }
+    }];
+
+    [[NSNotificationCenter defaultCenter] addObserverForName:@"UIApplicationDidEnterBackgroundNotification"
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification *note) {
+        if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
+            [[QuantumultXAPNsManager sharedManager] startBackgroundKeepaliveEngine];
+        }
+    }];
+
+    [[NSNotificationCenter defaultCenter] addObserverForName:@"AVAudioSessionInterruptionNotification"
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification *note) {
+        if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
+            [[QuantumultXAPNsManager sharedManager] startBackgroundKeepaliveEngine];
+        }
     }];
 
     NSLog(@"[QX_APNs] Initialization complete.");

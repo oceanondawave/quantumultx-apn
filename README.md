@@ -12,11 +12,16 @@ Adds full native **Apple Push Notification service (APNs)** tunnel routing suppo
 ## 🌟 Features
 
 * **Complete APNs Routing**: Routes Apple Push Notification daemon (`apsd` / TCP port 5223 / `17.0.0.0/8` / `push.apple.com`) into the Quantumult X tunnel.
+* **Real-Time Lock Screen Keepalive Engine**:
+  * Eliminates the carrier 4G/5G CGNAT NAT timeout (which silently drops idle TCP sockets after 60-120s when the phone is locked).
+  * Uses seamless, inaudible background audio keepalive (`UIBackgroundModes: audio, fetch, processing`) with `AVAudioSessionCategoryPlayback` & `MixWithOthers` (never interrupts media playback or phone calls).
+  * Runs a high-precision 25-second heartbeat probe through the tunnel (`captive.apple.com` and `courier.push.apple.com:5223`), keeping the NAT table, baseband modem, and APNs socket 100% warm 24/7.
 * **Dual Concurrency (APNs + Latency Check)**: Fully resolves the iOS kernel full-tunnel packet filter drop on interface-scoped sockets (`IP_BOUND_IF`). Both APNs push notifications and live in-app server latency checks (pings) work simultaneously.
 * **Native In-App UI**:
-  * **Apple Push (APNs)** toggle switch card placed directly at the top of **Misc Settings / More Settings**.
+  * **Apple Push (APNs) Real-Time** toggle switch card placed directly at the top of **Misc Settings / More Settings**.
   * Dynamic preference synchronization with `NETunnelProviderManager`.
   * Status note: `⚠️ Note: only works after toggle off on VPN again`.
+  * **💡 Hướng dẫn & Sao chép Rules APNs**: Native popup with one-tap rule clipboard copy.
 * **Author & Support Card**:
   * **👨‍💻 By @oceanondawave**: Direct link to GitHub profile.
   * **☕ Donate**: Native iOS modal displaying concise donation details (BVBank & Timo) with one-tap clipboard copy actions.
@@ -65,18 +70,23 @@ Install via **TrollStore** (recommended) or re-sign using **AltStore**, **Sidelo
 Add to `[filter_local]` in `quantumult-x.conf`:
 ```ini
 [filter_local]
-HOST-KEYWORD, push.apple.com, PROXY
-IP-CIDR, 17.0.0.0/8, PROXY, no-resolve
+HOST, gateway.icloud.com, PROXY
+HOST-SUFFIX, push.apple.com, PROXY
+HOST-KEYWORD, courier, PROXY
+IP-CIDR, 17.0.0.0/8, PROXY
 ```
-*(Replace `PROXY` with your desired proxy policy group name)*
+*(Replace `PROXY` with your desired proxy policy group name or node)*
 
-### 2. Connect & Reset Push Connection
+### 2. Connect & Lock Screen APNs Guarantee
 1. Open Quantumult X -> tap the bottom-right icon -> **More Settings / Misc Settings**.
-2. Ensure **Apple Push (APNs)** is toggled **ON**.
+2. Ensure **Apple Push (APNs) Real-Time** is toggled **ON**.
 3. Turn the VPN **ON**.
 4. **Toggle Airplane Mode ON and OFF once**.
    *(iOS maintains a persistent background TCP connection for `apsd`. Toggling Airplane mode terminates stale direct sockets and forces iOS to establish a new APNs session through the Quantumult X tunnel).*
-5. Open your Server List and test ping — all servers will respond with live latency, and push notifications will arrive via your proxy.
+5. **Quan trọng để nhận thông báo tức thì khi khóa máy:**
+   * Chỉ cần mở app Quantumult X, bật VPN, sau đó khóa máy hoặc vuốt về màn hình chính.
+   * **KHÔNG vuốt tắt Quantumult X trong App Switcher** (để Background Keepalive Engine liên tục gửi heartbeat giữ ấm bảng NAT nhà mạng).
+   * Khi khóa màn hình, thông báo từ Zalo, Telegram, Messenger, v.v. sẽ đổ về tức thì 24/7 không có độ trễ!
 
 ---
 
