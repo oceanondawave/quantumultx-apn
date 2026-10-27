@@ -70,10 +70,10 @@ Install via **TrollStore** (recommended) or re-sign using **AltStore**, **Sidelo
 Add to `[filter_local]` in `quantumult-x.conf`:
 ```ini
 [filter_local]
-HOST, gateway.icloud.com, PROXY
-HOST-SUFFIX, push.apple.com, PROXY
-HOST-KEYWORD, courier, PROXY
-IP-CIDR, 17.0.0.0/8, PROXY
+host, gateway.icloud.com, PROXY
+host-suffix, push.apple.com, PROXY
+host-keyword, courier, PROXY
+ip-cidr, 17.0.0.0/8, PROXY
 ```
 *(Replace `PROXY` with your desired proxy policy group name or node)*
 
