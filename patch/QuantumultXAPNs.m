@@ -433,10 +433,12 @@ static __unsafe_unretained id currentMoreSettingsVC = nil;
     BOOL apnsEnabled = [self isAPNsEnabled];
     NSLog(@"[QX_APNs] applyAPNsRoutingToProtocol: apnsEnabled = %d", (int)apnsEnabled);
 
-    // 1. includeAllNetworks: NO (Matching Stash architecture; keeps kernel packet filter from blocking physical en0 socket binding)
+    // 1. includeAllNetworks: MUST be YES when APNs is enabled!
+    // In iOS NetworkExtension (NEVPNProtocol.h), excludeAPNs only applies when includeAllNetworks is YES.
+    // If includeAllNetworks is NO, APNs traffic is excluded from the tunnel by default.
     if ([protocol respondsToSelector:@selector(setIncludeAllNetworks:)]) {
-        ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, @selector(setIncludeAllNetworks:), NO);
-        NSLog(@"[QX_APNs] protocol.includeAllNetworks = NO");
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, @selector(setIncludeAllNetworks:), apnsEnabled);
+        NSLog(@"[QX_APNs] protocol.includeAllNetworks = %d", (int)apnsEnabled);
     }
 
     // 2. excludeAPNs:
@@ -449,25 +451,27 @@ static __unsafe_unretained id currentMoreSettingsVC = nil;
         NSLog(@"[QX_APNs] protocol.excludeAPNs = %d", (int)excludeAPNs);
     }
 
-    // 3. enforceRoutes: Explicitly NO!
+    // 3. excludeLocalNetworks: YES!
+    // Crucial: keeps LAN, WiFi gateway, router ARP outside the tunnel so internet connects immediately upon VPN reconnect without stalls!
+    SEL selExcludeLocal = sel_registerName("setExcludeLocalNetworks:");
+    if ([protocol respondsToSelector:selExcludeLocal]) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, selExcludeLocal, YES);
+        NSLog(@"[QX_APNs] protocol.excludeLocalNetworks = YES");
+    }
+
+    // 4. excludeCellularServices: YES!
+    // Crucial: keeps VoLTE, Wi-Fi calling, carrier SMS/MMS services outside the tunnel.
+    SEL selExcludeCell = sel_registerName("setExcludeCellularServices:");
+    if ([protocol respondsToSelector:selExcludeCell]) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, selExcludeCell, YES);
+        NSLog(@"[QX_APNs] protocol.excludeCellularServices = YES");
+    }
+
+    // 5. enforceRoutes: Explicitly NO!
     SEL selEnforceRoutes = sel_registerName("setEnforceRoutes:");
     if ([protocol respondsToSelector:selEnforceRoutes]) {
         ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, selEnforceRoutes, NO);
         NSLog(@"[QX_APNs] protocol.enforceRoutes = NO");
-    }
-
-    // 4. excludeLocalNetworks: Explicitly NO!
-    SEL selExcludeLocal = sel_registerName("setExcludeLocalNetworks:");
-    if ([protocol respondsToSelector:selExcludeLocal]) {
-        ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, selExcludeLocal, NO);
-        NSLog(@"[QX_APNs] protocol.excludeLocalNetworks = NO");
-    }
-
-    // 5. excludeCellularServices: Explicitly NO!
-    SEL selExcludeCell = sel_registerName("setExcludeCellularServices:");
-    if ([protocol respondsToSelector:selExcludeCell]) {
-        ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, selExcludeCell, NO);
-        NSLog(@"[QX_APNs] protocol.excludeCellularServices = NO");
     }
 }
 
