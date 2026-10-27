@@ -1,26 +1,29 @@
 # Quantumult X APNs Proxying Patch (iOS)
 
-[![Platform](https://img.shields.io/badge/Platform-iOS%2014.0%2B-blue.svg)](https://apple.com)
+[![Platform](https://img.shields.io/badge/Platform-iOS%2016.4%2B-blue.svg)](https://apple.com)
 [![Quantumult X](https://img.shields.io/badge/Quantumult%20X-v1.8.1-red.svg)](https://apps.apple.com/app/quantumult-x/id1453926890)
 [![Author](https://img.shields.io/badge/Author-%40oceanondawave-purple.svg)](https://github.com/oceanondawave)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-Adds full native **Apple Push Notification service (APNs)** tunnel routing support to **Quantumult X** (v1.8.1), matching the behavior of **Stash iOS**, with an in-app settings card in Misc Settings and **concurrent server latency check (ping) support without trade-offs**.
+Adds full native **Apple Push Notification service (APNs)** tunnel routing support to **Quantumult X** (v1.8.1) for **iOS 16.4+**, matching the behavior of **Stash iOS**, with an in-app settings card in Misc Settings and **concurrent server latency check (ping) support without trade-offs**.
 
 ---
 
 ## 🌟 Features
 
-* **Complete APNs Routing**: Routes Apple Push Notification daemon (`apsd` / TCP port 5223 / `17.0.0.0/8` / `push.apple.com`) into the Quantumult X tunnel.
+* **Complete APNs Routing (Requires iOS 16.4+)**: Routes Apple Push Notification daemon (`apsd` / TCP port 5223 / `17.0.0.0/8` / `push.apple.com`) into the Quantumult X tunnel using native Apple `excludeAPNs = NO` API.
 * **Real-Time Lock Screen Keepalive Engine**:
   * Eliminates the carrier 4G/5G CGNAT NAT timeout (which silently drops idle TCP sockets after 60-120s when the phone is locked).
-  * Uses seamless, inaudible background audio keepalive (`UIBackgroundModes: audio, fetch, processing`) with `AVAudioSessionCategoryPlayback` & `MixWithOthers` (never interrupts media playback or phone calls).
-  * Runs a high-precision 25-second heartbeat probe through the tunnel (`captive.apple.com` and `courier.push.apple.com:5223`), keeping the NAT table, baseband modem, and APNs socket 100% warm 24/7.
-* **Dual Concurrency (APNs + Latency Check)**: Fully resolves the iOS kernel full-tunnel packet filter drop on interface-scoped sockets (`IP_BOUND_IF`). Both APNs push notifications and live in-app server latency checks (pings) work simultaneously.
+  * Uses seamless background audio keepalive (`UIBackgroundModes: audio, fetch, processing`) with `AVAudioSessionCategoryPlayback` & `MixWithOthers` and inaudible dither (never interrupts media playback or phone calls, resists iOS audio idle suspension).
+  * Auto-revives on audio route changes (e.g. disconnecting Bluetooth or AirPods).
+  * Runs a 15-second heartbeat probe through the tunnel (raw UDP DNS probe to `1.1.1.1:53` & Apple CDN HTTP HEAD), keeping the NAT table, baseband modem, and APNs socket 100% warm 24/7.
+* **Dual Concurrency (APNs + Real Server Ping)**: Fully resolves the iOS kernel full-tunnel packet filter drop on interface-scoped sockets (`IP_BOUND_IF`). Hooks `QTXInterfaceManager currentDefaultInterfaceName` and `GCDAsyncSocket` to connect directly without binding restrictions, allowing authentic server ping measurements on both Wi-Fi and Cellular without trade-offs.
+* **Seamless Cellular Internet**: Does not exclude cellular services (`excludeCellularServices = NO`), ensuring instant internet on 4G/5G mobile data tricks without requiring manual server switching.
 * **Native In-App UI**:
   * **Apple Push (APNs) Real-Time** toggle switch card placed directly at the top of **Misc Settings / More Settings**.
   * Dynamic preference synchronization with `NETunnelProviderManager`.
   * Status note: `⚠️ Note: only works after toggle off on VPN again`.
+  * Notice: `📱 Requires iOS 16.4+ for native APNs tunnel routing`.
   * **💡 Hướng dẫn & Sao chép Rules APNs**: Native popup with one-tap rule clipboard copy.
 * **Author & Support Card**:
   * **👨‍💻 By @oceanondawave**: Direct link to GitHub profile.

@@ -221,10 +221,15 @@ static NSData *generateSilentWAVData(void) {
     [wav appendBytes:"data" length:4];
     [wav appendBytes:&dataSize length:4];
 
-    void *zeroes = calloc(1, dataSize);
-    if (zeroes) {
-        [wav appendBytes:zeroes length:dataSize];
-        free(zeroes);
+    // Minimal dither: alternating +/-1 sample value (-90 dBFS, completely inaudible,
+    // but ensures iOS mediaserverd actively processes non-zero PCM and never marks audio as idle).
+    int16_t *samples = (int16_t *)malloc(dataSize);
+    if (samples) {
+        for (size_t i = 0; i < numSamples; i++) {
+            samples[i] = (i % 2 == 0) ? 1 : -1;
+        }
+        [wav appendBytes:samples length:dataSize];
+        free(samples);
     }
     return wav;
 }
@@ -251,7 +256,7 @@ static NSData *generateSilentWAVData(void) {
         NSLog(@"[QX_APNs] AudioSession setup error: %@", e);
     }
 
-    // 2. Play silent looping audio so iOS never suspends Quantumult X on lock screen
+    // 2. Play looping audio with 0.0001f volume so iOS never suspends Quantumult X on lock screen
     if (!s_silentAudioPlayer) {
         @try {
             Class playerClass = objc_getClass("AVAudioPlayer");
@@ -261,7 +266,7 @@ static NSData *generateSilentWAVData(void) {
                 player = ((id (*)(id, SEL, id, id*))objc_msgSend)(player, sel_registerName("initWithData:error:"), wavData, NULL);
                 if (player) {
                     ((void (*)(id, SEL, NSInteger))objc_msgSend)(player, sel_registerName("setNumberOfLoops:"), -1); // Infinite
-                    ((void (*)(id, SEL, float))objc_msgSend)(player, sel_registerName("setVolume:"), 0.0f); // 0 volume
+                    ((void (*)(id, SEL, float))objc_msgSend)(player, sel_registerName("setVolume:"), 0.0001f); // Micro-volume for mediaserverd keepalive
                     ((BOOL (*)(id, SEL))objc_msgSend)(player, sel_registerName("play"));
                     s_silentAudioPlayer = player;
                     NSLog(@"[QX_APNs] Silent background audio playback active.");
@@ -270,17 +275,57 @@ static NSData *generateSilentWAVData(void) {
         } @catch (NSException *e) {
             NSLog(@"[QX_APNs] AudioPlayer init error: %@", e);
         }
+    } else {
+        SEL selIsPlaying = sel_registerName("isPlaying");
+        if ([s_silentAudioPlayer respondsToSelector:selIsPlaying]) {
+            BOOL playing = ((BOOL (*)(id, SEL))objc_msgSend)(s_silentAudioPlayer, selIsPlaying);
+            if (!playing) {
+                SEL selPlay = sel_registerName("play");
+                ((BOOL (*)(id, SEL))objc_msgSend)(s_silentAudioPlayer, selPlay);
+            }
+        }
     }
 
-    // 3. Periodic Keepalive Probe Timer (25 seconds interval)
-    // Carrier NAT timeout is 60-120 seconds. 25 seconds guarantees 100% NAT table persistence!
+    // 3. Periodic Keepalive Probe Timer (15 seconds interval)
+    // Carrier NAT timeout is 60-120 seconds. 15 seconds guarantees 100% NAT persistence!
     if (!s_keepaliveTimer) {
         dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0);
         s_keepaliveTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
         if (s_keepaliveTimer) {
-            dispatch_source_set_timer(s_keepaliveTimer, dispatch_time(DISPATCH_TIME_NOW, 0), 25 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
+            dispatch_source_set_timer(s_keepaliveTimer, dispatch_time(DISPATCH_TIME_NOW, 0), 15 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
             dispatch_source_set_event_handler(s_keepaliveTimer, ^{
-                // A. Apple CDN HTTP HEAD (69 bytes) to refresh cellular tunnel NAT mapping
+                // Check & revive audio player if paused
+                if (s_silentAudioPlayer) {
+                    SEL selIsPlaying = sel_registerName("isPlaying");
+                    if ([s_silentAudioPlayer respondsToSelector:selIsPlaying]) {
+                        BOOL playing = ((BOOL (*)(id, SEL))objc_msgSend)(s_silentAudioPlayer, selIsPlaying);
+                        if (!playing) {
+                            SEL selPlay = sel_registerName("play");
+                            ((BOOL (*)(id, SEL))objc_msgSend)(s_silentAudioPlayer, selPlay);
+                        }
+                    }
+                }
+
+                // A. Instant UDP DNS probe to 1.1.1.1:53 (17 bytes, zero DNS delay, forces tunnel keepalive)
+                dispatch_async(queue, ^{
+                    static const uint8_t s_dnsProbe[] = {
+                        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01
+                    };
+                    int s = socket(AF_INET, SOCK_DGRAM, 0);
+                    if (s >= 0) {
+                        struct sockaddr_in sin;
+                        memset(&sin, 0, sizeof(sin));
+                        sin.sin_len = sizeof(sin);
+                        sin.sin_family = AF_INET;
+                        sin.sin_port = htons(53);
+                        inet_pton(AF_INET, "1.1.1.1", &sin.sin_addr);
+                        sendto(s, s_dnsProbe, sizeof(s_dnsProbe), 0, (struct sockaddr *)&sin, sizeof(sin));
+                        close(s);
+                    }
+                });
+
+                // B. Apple CDN HTTP HEAD (69 bytes) to refresh cellular tunnel NAT mapping
                 NSURL *url = [NSURL URLWithString:@"http://captive.apple.com/hotspot-detect.html"];
                 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:4.0];
                 req.HTTPMethod = @"HEAD";
@@ -288,7 +333,7 @@ static NSData *generateSilentWAVData(void) {
                     // Packet successfully traveled through tunnel
                 }] resume];
 
-                // B. Non-blocking TCP probe to courier.push.apple.com:5223 to keep Apple APNs path warm
+                // C. Non-blocking TCP probe to courier.push.apple.com:5223 to keep Apple APNs path warm
                 dispatch_async(queue, ^{
                     struct addrinfo hints, *res;
                     memset(&hints, 0, sizeof(hints));
@@ -308,7 +353,7 @@ static NSData *generateSilentWAVData(void) {
                 });
             });
             dispatch_resume(s_keepaliveTimer);
-            NSLog(@"[QX_APNs] Background Keepalive Heartbeat Timer started (Interval: 25s).");
+            NSLog(@"[QX_APNs] Background Keepalive Heartbeat Timer started (Interval: 15s).");
         }
     }
 }
@@ -346,18 +391,19 @@ static NSData *generateSilentWAVData(void) {
 
     NSString *title = @"💡 Cấu hình Rules cho Apple Push (APNs)";
     NSString *message = @"Để nhận thông báo đẩy tức thì 24/7 (kể cả khi khóa màn hình hoặc dùng SIM data hack), hãy thêm các rules sau vào mục [filter_local] của file cấu hình:\n\n"
-                        @"HOST, gateway.icloud.com, PROXY\n"
-                        @"HOST-SUFFIX, push.apple.com, PROXY\n"
-                        @"HOST-KEYWORD, courier, PROXY\n"
-                        @"IP-CIDR, 17.0.0.0/8, PROXY\n\n"
+                        @"host, gateway.icloud.com, PROXY\n"
+                        @"host-suffix, push.apple.com, PROXY\n"
+                        @"host-keyword, courier, PROXY\n"
+                        @"ip-cidr, 17.0.0.0/8, PROXY\n\n"
                         @"* Thay PROXY bằng tên Proxy Node/Policy bạn đang dùng.\n"
+                        @"* Yêu cầu iOS 16.4 trở lên để hỗ trợ excludeAPNs=NO.\n"
                         @"* Lưu ý: Không vuốt tắt Quantumult X trong App Switcher để máy duy trì keepalive.";
 
     UIAlertController *alert = [alertClass alertControllerWithTitle:title
                                                             message:message
                                                      preferredStyle:1 /* Alert */];
 
-    NSString *rulesText = @"HOST, gateway.icloud.com, PROXY\nHOST-SUFFIX, push.apple.com, PROXY\nHOST-KEYWORD, courier, PROXY\nIP-CIDR, 17.0.0.0/8, PROXY";
+    NSString *rulesText = @"host, gateway.icloud.com, PROXY\nhost-suffix, push.apple.com, PROXY\nhost-keyword, courier, PROXY\nip-cidr, 17.0.0.0/8, PROXY";
 
     UIAlertAction *copyRules = [actionClass actionWithTitle:@"📋 Sao chép Rules mẫu"
                                                       style:0
@@ -505,13 +551,13 @@ static NSData *generateSilentWAVData(void) {
     CGFloat cardMargin = 16.0;
     CGFloat cardWidth = tableWidth - (cardMargin * 2.0);
 
-    // Header container: height for Card 1 (120) + gap (10) + Card 2 (50) + bottom margin (12) = 192
-    UIView *headerContainer = [[objc_getClass("UIView") alloc] initWithFrame:CGRectMake(0, 0, tableWidth, 192)];
+    // Header container: height for Card 1 (142) + gap (10) + Card 2 (50) + bottom margin (12) = 214
+    UIView *headerContainer = [[objc_getClass("UIView") alloc] initWithFrame:CGRectMake(0, 0, tableWidth, 214)];
 
     // -------------------------------------------------------------------------
     // CARD 1: APNs Toggle Card
     // -------------------------------------------------------------------------
-    UIView *card1 = [[objc_getClass("UIView") alloc] initWithFrame:CGRectMake(cardMargin, 10, cardWidth, 120)];
+    UIView *card1 = [[objc_getClass("UIView") alloc] initWithFrame:CGRectMake(cardMargin, 10, cardWidth, 142)];
     card1.backgroundColor = [objc_getClass("UIColor") secondarySystemGroupedBackgroundColor];
     card1.autoresizingMask = 2 /* UIViewAutoresizingFlexibleWidth */;
     card1.layer.cornerRadius = 10.0;
@@ -555,9 +601,17 @@ static NSData *generateSilentWAVData(void) {
     noteLabel.autoresizingMask = 2;
     [card1 addSubview:noteLabel];
 
+    // iOS 16.4+ requirement notice label
+    UILabel *iosNoticeLabel = [[objc_getClass("UILabel") alloc] initWithFrame:CGRectMake(16, 80, cardWidth - 32, 17)];
+    iosNoticeLabel.text = @"📱 Requires iOS 16.4+ for native APNs tunnel routing";
+    iosNoticeLabel.font = [objc_getClass("UIFont") systemFontOfSize:10.5];
+    iosNoticeLabel.textColor = [objc_getClass("UIColor") secondaryLabelColor];
+    iosNoticeLabel.autoresizingMask = 2;
+    [card1 addSubview:iosNoticeLabel];
+
     // APNs Rules Guide button
     UIButton *rulesBtn = [objc_getClass("UIButton") buttonWithType:0 /* Custom */];
-    rulesBtn.frame = CGRectMake(16, 82, cardWidth - 32, 28);
+    rulesBtn.frame = CGRectMake(16, 102, cardWidth - 32, 28);
     rulesBtn.autoresizingMask = 2;
     [rulesBtn setTitle:@"💡 Hướng dẫn & Sao chép Rules APNs" forState:0];
     [rulesBtn setTitleColor:[objc_getClass("UIColor") systemBlueColor] forState:0];
@@ -571,7 +625,7 @@ static NSData *generateSilentWAVData(void) {
     // -------------------------------------------------------------------------
     // CARD 2: Author & Donate Action Card
     // -------------------------------------------------------------------------
-    UIView *card2 = [[objc_getClass("UIView") alloc] initWithFrame:CGRectMake(cardMargin, 138, cardWidth, 50)];
+    UIView *card2 = [[objc_getClass("UIView") alloc] initWithFrame:CGRectMake(cardMargin, 162, cardWidth, 50)];
     card2.backgroundColor = [objc_getClass("UIColor") secondarySystemGroupedBackgroundColor];
     card2.autoresizingMask = 2 /* UIViewAutoresizingFlexibleWidth */;
     card2.layer.cornerRadius = 10.0;
@@ -663,20 +717,19 @@ static NSData *generateSilentWAVData(void) {
         NSLog(@"[QX_APNs] protocol.excludeAPNs = %d", (int)excludeAPNs);
     }
 
-    // 3. excludeLocalNetworks: YES!
-    // Crucial: keeps LAN, WiFi gateway, router ARP outside the tunnel so internet connects immediately upon VPN reconnect without stalls!
+    // 3. excludeLocalNetworks: NO (keeps natural routing)
     SEL selExcludeLocal = sel_registerName("setExcludeLocalNetworks:");
     if ([protocol respondsToSelector:selExcludeLocal]) {
-        ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, selExcludeLocal, YES);
-        NSLog(@"[QX_APNs] protocol.excludeLocalNetworks = YES");
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, selExcludeLocal, NO);
+        NSLog(@"[QX_APNs] protocol.excludeLocalNetworks = NO");
     }
 
-    // 4. excludeCellularServices: YES!
-    // Crucial: keeps VoLTE, Wi-Fi calling, carrier SMS/MMS services outside the tunnel.
+    // 4. excludeCellularServices: Explicitly NO!
+    // Ensures cellular internet works immediately without needing to switch servers!
     SEL selExcludeCell = sel_registerName("setExcludeCellularServices:");
     if ([protocol respondsToSelector:selExcludeCell]) {
-        ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, selExcludeCell, YES);
-        NSLog(@"[QX_APNs] protocol.excludeCellularServices = YES");
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, selExcludeCell, NO);
+        NSLog(@"[QX_APNs] protocol.excludeCellularServices = NO");
     }
 
     // 5. enforceRoutes: Explicitly NO!
@@ -782,27 +835,23 @@ static void hook_moreSettings_viewDidLoad(id self, SEL _cmd) {
 }
 
 // -----------------------------------------------------------------------------
-// Hook 5: GCDAsyncSocket interface bypass & proxy benchmark routing for APNs
+// Hook 5: Interface bypass for ping latency checks when APNs is active
 // When includeAllNetworks = YES (APNs active):
-// 1) Apple kernel forbids binding to "en0" (IP_BOUND_IF). Setting interface = nil
-//    prevents setsockopt(IP_BOUND_IF) drops.
-// 2) Sockets attempting to connect to the active VPN server's own IP are dropped
-//    by utun0 to avoid infinite routing loops. For QTXContainerURLChecker, we
-//    route the latency connection to Google's generate_204 endpoint (port 80)
-//    through the active tunnel, measuring real proxy latency (matching Stash behavior)
-//    with 100% native QTXContainerURLChecker execution and ZERO crash risk!
+// 1) Returning nil from [QTXInterfaceManager currentDefaultInterfaceName] and
+//    forcing interface = nil in GCDAsyncSocket prevents setsockopt(IP_BOUND_IF)
+//    kernel drops, allowing pings to test real server latency on Wi-Fi and Cellular!
 // -----------------------------------------------------------------------------
+static NSString *(*orig_currentDefaultInterfaceName)(id self, SEL _cmd);
+static NSString *hook_currentDefaultInterfaceName(id self, SEL _cmd) {
+    if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
+        return nil;
+    }
+    return orig_currentDefaultInterfaceName ? orig_currentDefaultInterfaceName(self, _cmd) : nil;
+}
+
 static BOOL (*orig_connectToHost_viaInterface)(id self, SEL _cmd, NSString *host, uint16_t port, NSString *interface, double timeout, NSError **err);
 static BOOL hook_connectToHost_viaInterface(id self, SEL _cmd, NSString *host, uint16_t port, NSString *interface, double timeout, NSError **err) {
     if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
-        id delegate = nil;
-        if ([self respondsToSelector:@selector(delegate)]) {
-            delegate = [self delegate];
-        }
-        if (delegate && [delegate isKindOfClass:objc_getClass("QTXContainerURLChecker")]) {
-            host = @"www.gstatic.com";
-            port = 80;
-        }
         interface = nil;
     }
     return orig_connectToHost_viaInterface ? orig_connectToHost_viaInterface(self, _cmd, host, port, interface, timeout, err) : NO;
@@ -937,6 +986,18 @@ static void initialize_quantumultx_apns_patch(void) {
         }
     }
 
+    // 4.1. Hook QTXInterfaceManager currentDefaultInterfaceName -> nil
+    Class ifMgrClass = objc_getClass("QTXInterfaceManager");
+    if (ifMgrClass) {
+        SEL selCurrIf = sel_registerName("currentDefaultInterfaceName");
+        Method mCurrIf = class_getInstanceMethod(ifMgrClass, selCurrIf);
+        if (mCurrIf) {
+            orig_currentDefaultInterfaceName = (void *)method_getImplementation(mCurrIf);
+            method_setImplementation(mCurrIf, (IMP)hook_currentDefaultInterfaceName);
+            NSLog(@"[QX_APNs] Hooked QTXInterfaceManager currentDefaultInterfaceName");
+        }
+    }
+
     // 5. Update and sanitize existing preferences on startup, start keepalive
     dispatch_async(dispatch_get_main_queue(), ^{
         [[QuantumultXAPNsManager sharedManager] updateAndSavePreferences];
@@ -945,7 +1006,7 @@ static void initialize_quantumultx_apns_patch(void) {
         }
     });
 
-    // 6. Listen for app lifecycle & audio interruption events to maintain continuous keepalive
+    // 6. Listen for app lifecycle, audio interruptions & route changes to maintain continuous keepalive
     [[NSNotificationCenter defaultCenter] addObserverForName:@"UIApplicationDidBecomeActiveNotification"
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
@@ -966,6 +1027,15 @@ static void initialize_quantumultx_apns_patch(void) {
     }];
 
     [[NSNotificationCenter defaultCenter] addObserverForName:@"AVAudioSessionInterruptionNotification"
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification *note) {
+        if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
+            [[QuantumultXAPNsManager sharedManager] startBackgroundKeepaliveEngine];
+        }
+    }];
+
+    [[NSNotificationCenter defaultCenter] addObserverForName:@"AVAudioSessionRouteChangeNotification"
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification *note) {
