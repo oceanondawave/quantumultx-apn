@@ -739,6 +739,105 @@ static void activateAudioSessionAndPlay(void) {
 // -----------------------------------------------------------------------------
 static void (*orig_saveToPreferencesWithCompletionHandler)(id self, SEL _cmd, void (^completionHandler)(NSError *error));
 
+// -----------------------------------------------------------------------------
+// Auto-Sanitize default.conf for HTTP & SOCKS5 Proxy Sharing (LAN / Hotspot)
+// -----------------------------------------------------------------------------
+static void ensureExcludedRoutesInConfiguration(void) {
+    @try {
+        NSURL *groupURL = [[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:@"group.com.crossutility.quantumult-x"];
+        if (!groupURL) return;
+
+        NSURL *confURL = [groupURL URLByAppendingPathComponent:@"default.conf"];
+        if (![[NSFileManager defaultManager] fileExistsAtPath:[confURL path]]) return;
+
+        NSError *err = nil;
+        NSString *conf = [NSString stringWithContentsOfURL:confURL encoding:NSUTF8StringEncoding error:&err];
+        if (!conf || err) return;
+
+        NSArray *required = @[@"192.168.0.0/16", @"172.16.0.0/12", @"100.64.0.0/10", @"10.0.0.0/8"];
+        NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"^[;#\\s]*excluded_routes\\s*=\\s*(.*)$"
+                                                                               options:NSRegularExpressionAnchorsMatchLines
+                                                                                 error:nil];
+        NSTextCheckingResult *match = [regex firstMatchInString:conf options:0 range:NSMakeRange(0, conf.length)];
+        BOOL modified = NO;
+        if (match) {
+            NSString *existingLine = [conf substringWithRange:match.range];
+            BOOL isCommented = [existingLine hasPrefix:@";"] || [existingLine hasPrefix:@"#"];
+            NSString *existingVal = [conf substringWithRange:[match rangeAtIndex:1]];
+            NSArray *parts = [existingVal componentsSeparatedByString:@","];
+            NSMutableArray *routes = [NSMutableArray array];
+            for (NSString *p in parts) {
+                NSString *trimmed = [p stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                if (trimmed.length > 0) [routes addObject:trimmed];
+            }
+            BOOL missingAny = NO;
+            for (NSString *req in required) {
+                if (![routes containsObject:req]) {
+                    [routes addObject:req];
+                    missingAny = YES;
+                }
+            }
+            if (isCommented || missingAny) {
+                NSString *newLine = [NSString stringWithFormat:@"excluded_routes = %@", [routes componentsJoinedByString:@", "]];
+                conf = [conf stringByReplacingCharactersInRange:match.range withString:newLine];
+                modified = YES;
+            }
+        } else {
+            NSRange genRange = [conf rangeOfString:@"[general]" options:NSCaseInsensitiveSearch];
+            if (genRange.location != NSNotFound) {
+                NSUInteger insertPos = genRange.location + genRange.length;
+                NSString *insertStr = [NSString stringWithFormat:@"\nexcluded_routes = %@", [required componentsJoinedByString:@", "]];
+                conf = [NSString stringWithFormat:@"%@%@%@", [conf substringToIndex:insertPos], insertStr, [conf substringFromIndex:insertPos]];
+                modified = YES;
+            } else {
+                conf = [NSString stringWithFormat:@"[general]\nexcluded_routes = %@\n\n%@", [required componentsJoinedByString:@", "], conf];
+                modified = YES;
+            }
+        }
+
+        if (modified) {
+            [conf writeToURL:confURL atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            NSLog(@"[QX_APNs] Injected excluded_routes into default.conf for LAN/Hotspot proxy sharing.");
+        }
+    } @catch (NSException *e) {
+        NSLog(@"[QX_APNs] ensureExcludedRoutesInConfiguration exception: %@", e);
+    }
+}
+
+static void (*orig_setHTTPProxyEnabled)(id self, SEL _cmd, BOOL enabled);
+static void hook_setHTTPProxyEnabled(id self, SEL _cmd, BOOL enabled) {
+    if (enabled) {
+        ensureExcludedRoutesInConfiguration();
+    }
+    if (orig_setHTTPProxyEnabled) {
+        orig_setHTTPProxyEnabled(self, _cmd, enabled);
+    }
+}
+
+static void (*orig_setSOCKS5ProxyEnabled)(id self, SEL _cmd, BOOL enabled);
+static void hook_setSOCKS5ProxyEnabled(id self, SEL _cmd, BOOL enabled) {
+    if (enabled) {
+        ensureExcludedRoutesInConfiguration();
+    }
+    if (orig_setSOCKS5ProxyEnabled) {
+        orig_setSOCKS5ProxyEnabled(self, _cmd, enabled);
+    }
+}
+
+static void (*orig_configMgr_reloadConfiguration)(id self, SEL _cmd);
+static void hook_configMgr_reloadConfiguration(id self, SEL _cmd) {
+    ensureExcludedRoutesInConfiguration();
+    if (orig_configMgr_reloadConfiguration) {
+        orig_configMgr_reloadConfiguration(self, _cmd);
+    }
+}
+
+static BOOL (*orig_configMgr_validateConfiguration)(id self, SEL _cmd, id conf, NSError **err);
+static BOOL hook_configMgr_validateConfiguration(id self, SEL _cmd, id conf, NSError **err) {
+    ensureExcludedRoutesInConfiguration();
+    return orig_configMgr_validateConfiguration ? orig_configMgr_validateConfiguration(self, _cmd, conf, err) : YES;
+}
+
 static void hook_saveToPreferencesWithCompletionHandler(id self, SEL _cmd, void (^completionHandler)(NSError *error)) {
     id protocol = nil;
     SEL selProtocol = sel_registerName("protocolConfiguration");
@@ -749,6 +848,8 @@ static void hook_saveToPreferencesWithCompletionHandler(id self, SEL _cmd, void 
     if (protocol) {
         [[QuantumultXAPNsManager sharedManager] applyAPNsRoutingToProtocol:protocol];
     }
+
+    ensureExcludedRoutesInConfiguration();
 
     if (orig_saveToPreferencesWithCompletionHandler) {
         orig_saveToPreferencesWithCompletionHandler(self, _cmd, completionHandler);
@@ -968,8 +1069,49 @@ static void initialize_quantumultx_apns_patch(void) {
         }
     }
 
+    // 4.2. Hook QTXDashboardManager proxy toggle methods to auto-sanitize excluded_routes
+    Class dashMgrClass = objc_getClass("QTXDashboardManager");
+    if (dashMgrClass) {
+        SEL selSetHTTP = sel_registerName("setHTTPProxyEnabled:");
+        Method mSetHTTP = class_getInstanceMethod(dashMgrClass, selSetHTTP);
+        if (mSetHTTP) {
+            orig_setHTTPProxyEnabled = (void *)method_getImplementation(mSetHTTP);
+            method_setImplementation(mSetHTTP, (IMP)hook_setHTTPProxyEnabled);
+            NSLog(@"[QX_APNs] Hooked QTXDashboardManager setHTTPProxyEnabled:");
+        }
+
+        SEL selSetSOCKS = sel_registerName("setSOCKS5ProxyEnabled:");
+        Method mSetSOCKS = class_getInstanceMethod(dashMgrClass, selSetSOCKS);
+        if (mSetSOCKS) {
+            orig_setSOCKS5ProxyEnabled = (void *)method_getImplementation(mSetSOCKS);
+            method_setImplementation(mSetSOCKS, (IMP)hook_setSOCKS5ProxyEnabled);
+            NSLog(@"[QX_APNs] Hooked QTXDashboardManager setSOCKS5ProxyEnabled:");
+        }
+    }
+
+    // 4.3. Hook QTXConfigurationManager to auto-sanitize excluded_routes on reload / validation
+    Class configMgrClass = objc_getClass("QTXConfigurationManager");
+    if (configMgrClass) {
+        SEL selReload = sel_registerName("reloadConfiguration");
+        Method mReload = class_getInstanceMethod(configMgrClass, selReload);
+        if (mReload) {
+            orig_configMgr_reloadConfiguration = (void *)method_getImplementation(mReload);
+            method_setImplementation(mReload, (IMP)hook_configMgr_reloadConfiguration);
+            NSLog(@"[QX_APNs] Hooked QTXConfigurationManager reloadConfiguration");
+        }
+
+        SEL selValidate = sel_registerName("validateConfiguration:withError:");
+        Method mValidate = class_getInstanceMethod(configMgrClass, selValidate);
+        if (mValidate) {
+            orig_configMgr_validateConfiguration = (void *)method_getImplementation(mValidate);
+            method_setImplementation(mValidate, (IMP)hook_configMgr_validateConfiguration);
+            NSLog(@"[QX_APNs] Hooked QTXConfigurationManager validateConfiguration:withError:");
+        }
+    }
+
     // 5. Update and sanitize existing preferences on startup, start keepalive
     dispatch_async(dispatch_get_main_queue(), ^{
+        ensureExcludedRoutesInConfiguration();
         [[QuantumultXAPNsManager sharedManager] updateAndSavePreferences];
         if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
             [[QuantumultXAPNsManager sharedManager] startBackgroundKeepaliveEngine];
@@ -981,6 +1123,7 @@ static void initialize_quantumultx_apns_patch(void) {
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification *note) {
+        ensureExcludedRoutesInConfiguration();
         [[QuantumultXAPNsManager sharedManager] updateAndSavePreferences];
         if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
             [[QuantumultXAPNsManager sharedManager] startBackgroundKeepaliveEngine];
@@ -991,6 +1134,7 @@ static void initialize_quantumultx_apns_patch(void) {
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification *note) {
+        ensureExcludedRoutesInConfiguration();
         [[QuantumultXAPNsManager sharedManager] updateAndSavePreferences];
         if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
             [[QuantumultXAPNsManager sharedManager] startBackgroundKeepaliveEngine];
