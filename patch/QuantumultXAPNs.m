@@ -1243,7 +1243,7 @@ static void initialize_quantumultx_apns_patch(void) {
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification *note) {
         if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
-            activateAudioSessionAndPlay();
+            [[QuantumultXAPNsManager sharedManager] startBackgroundKeepaliveEngine];
         }
     }];
 
