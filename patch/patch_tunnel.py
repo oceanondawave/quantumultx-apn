@@ -35,7 +35,7 @@ def patch_tunnel_binary(tunnel_path):
 
         # Restore sleepWithCompletionHandler: if previously renamed
         # -[QTXPacketTunnelProvider sleepWithCompletionHandler:] schedules fire dates
-        # which must remain intact for clean sleep/wake cycle handling and proxy server operation.
+        # which must remain intact for clean sleep/wake cycle handling.
         str_offset = 0x57afab
         f.seek(str_offset)
         curr_str = f.read(28)
