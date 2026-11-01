@@ -204,19 +204,6 @@ static __unsafe_unretained id currentMoreSettingsVC = nil;
 
 static id s_silentAudioPlayer = nil;
 static dispatch_source_t s_keepaliveTimer = NULL;
-static NSUInteger s_bgTaskId = 0;
-
-static void renewBackgroundTask(void) {
-    id app = [objc_getClass("UIApplication") sharedApplication];
-    if (!app) return;
-    NSUInteger oldId = s_bgTaskId;
-    s_bgTaskId = ((NSUInteger (*)(id, SEL, id, id))objc_msgSend)(app, sel_registerName("beginBackgroundTaskWithName:expirationHandler:"), @"QX_APNs_Keepalive", ^{
-        renewBackgroundTask();
-    });
-    if (oldId != 0) {
-        ((void (*)(id, SEL, NSUInteger))objc_msgSend)(app, sel_registerName("endBackgroundTask:"), oldId);
-    }
-}
 
 static NSData *generateSilentWAVData(void) {
     uint32_t sampleRate = 8000;
@@ -308,8 +295,7 @@ static void activateAudioSessionAndPlay(void) {
         return;
     }
 
-    // 1. Activate background task & audio session for continuous lockscreen background execution
-    renewBackgroundTask();
+    // 1. Activate audio session & silent player for continuous lockscreen background execution
     activateAudioSessionAndPlay();
 
     // 2. Periodic Keepalive Probe Timer (15 seconds interval)
@@ -320,33 +306,10 @@ static void activateAudioSessionAndPlay(void) {
         if (s_keepaliveTimer) {
             dispatch_source_set_timer(s_keepaliveTimer, dispatch_time(DISPATCH_TIME_NOW, 0), 15 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
             dispatch_source_set_event_handler(s_keepaliveTimer, ^{
-                // Check & revive audio player and background task
+                // Check & revive audio player
                 activateAudioSessionAndPlay();
-                renewBackgroundTask();
 
-                // A. Instant stateless UDP DNS probe to 1.1.1.1:53 & 8.8.8.8:53 (17 bytes)
-                // Refreshes carrier NAT mapping for both IPv4 and IPv6 immediately and keeps baseband RRC warm
-                dispatch_async(queue, ^{
-                    static const uint8_t s_dnsProbe[] = {
-                        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
-                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01
-                    };
-                    int s = socket(AF_INET, SOCK_DGRAM, 0);
-                    if (s >= 0) {
-                        struct sockaddr_in sin;
-                        memset(&sin, 0, sizeof(sin));
-                        sin.sin_len = sizeof(sin);
-                        sin.sin_family = AF_INET;
-                        sin.sin_port = htons(53);
-                        inet_pton(AF_INET, "1.1.1.1", &sin.sin_addr);
-                        sendto(s, s_dnsProbe, sizeof(s_dnsProbe), 0, (struct sockaddr *)&sin, sizeof(sin));
-                        inet_pton(AF_INET, "8.8.8.8", &sin.sin_addr);
-                        sendto(s, s_dnsProbe, sizeof(s_dnsProbe), 0, (struct sockaddr *)&sin, sizeof(sin));
-                        close(s);
-                    }
-                });
-
-                // B. Apple CDN HTTP HEAD (69 bytes) to refresh tunnel NAT mapping
+                // Apple CDN HTTP HEAD (69 bytes) to refresh tunnel NAT mapping
                 NSURL *url = [NSURL URLWithString:@"http://captive.apple.com/hotspot-detect.html"];
                 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:4.0];
                 req.HTTPMethod = @"HEAD";
@@ -373,14 +336,6 @@ static void activateAudioSessionAndPlay(void) {
         } @catch (NSException *e) {}
         s_silentAudioPlayer = nil;
         NSLog(@"[QX_APNs] Silent background audio stopped.");
-    }
-
-    if (s_bgTaskId != 0) {
-        id app = [objc_getClass("UIApplication") sharedApplication];
-        if (app) {
-            ((void (*)(id, SEL, NSUInteger))objc_msgSend)(app, sel_registerName("endBackgroundTask:"), s_bgTaskId);
-        }
-        s_bgTaskId = 0;
     }
 
     @try {
@@ -1288,7 +1243,6 @@ static void initialize_quantumultx_apns_patch(void) {
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification *note) {
         if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
-            renewBackgroundTask();
             activateAudioSessionAndPlay();
         }
     }];
