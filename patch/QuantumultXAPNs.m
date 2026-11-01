@@ -204,6 +204,19 @@ static __unsafe_unretained id currentMoreSettingsVC = nil;
 
 static id s_silentAudioPlayer = nil;
 static dispatch_source_t s_keepaliveTimer = NULL;
+static NSUInteger s_bgTaskId = 0;
+
+static void renewBackgroundTask(void) {
+    id app = [objc_getClass("UIApplication") sharedApplication];
+    if (!app) return;
+    NSUInteger oldId = s_bgTaskId;
+    s_bgTaskId = ((NSUInteger (*)(id, SEL, id, id))objc_msgSend)(app, sel_registerName("beginBackgroundTaskWithName:expirationHandler:"), @"QX_APNs_Keepalive", ^{
+        renewBackgroundTask();
+    });
+    if (oldId != 0) {
+        ((void (*)(id, SEL, NSUInteger))objc_msgSend)(app, sel_registerName("endBackgroundTask:"), oldId);
+    }
+}
 
 static NSData *generateSilentWAVData(void) {
     uint32_t sampleRate = 8000;
@@ -232,11 +245,15 @@ static NSData *generateSilentWAVData(void) {
     [wav appendBytes:"data" length:4];
     [wav appendBytes:&dataSize length:4];
 
-    // Clean, perfect silent PCM buffer (all zeroes)
-    void *silence = calloc(1, dataSize);
-    if (silence) {
-        [wav appendBytes:silence length:dataSize];
-        free(silence);
+    // Minimal dither: alternating +/-1 sample value (-90 dBFS, completely inaudible,
+    // but ensures iOS mediaserverd actively processes non-zero PCM and never marks audio as idle/suspended).
+    int16_t *samples = (int16_t *)malloc(dataSize);
+    if (samples) {
+        for (size_t i = 0; i < numSamples; i++) {
+            samples[i] = (i % 2 == 0) ? 1 : -1;
+        }
+        [wav appendBytes:samples length:dataSize];
+        free(samples);
     }
     return wav;
 }
@@ -262,7 +279,7 @@ static void activateAudioSessionAndPlay(void) {
                 player = ((id (*)(id, SEL, id, id*))objc_msgSend)(player, sel_registerName("initWithData:error:"), wavData, NULL);
                 if (player) {
                     ((void (*)(id, SEL, NSInteger))objc_msgSend)(player, sel_registerName("setNumberOfLoops:"), -1); // Infinite loop
-                    ((void (*)(id, SEL, float))objc_msgSend)(player, sel_registerName("setVolume:"), 0.0f); // Pure zero volume
+                    ((void (*)(id, SEL, float))objc_msgSend)(player, sel_registerName("setVolume:"), 0.0001f); // Micro-volume for mediaserverd keepalive
                     ((BOOL (*)(id, SEL))objc_msgSend)(player, sel_registerName("prepareToPlay"));
                     BOOL ok = ((BOOL (*)(id, SEL))objc_msgSend)(player, sel_registerName("play"));
                     s_silentAudioPlayer = player;
@@ -291,7 +308,8 @@ static void activateAudioSessionAndPlay(void) {
         return;
     }
 
-    // 1. Activate audio session & silent player for continuous lockscreen background execution
+    // 1. Activate background task & audio session for continuous lockscreen background execution
+    renewBackgroundTask();
     activateAudioSessionAndPlay();
 
     // 2. Periodic Keepalive Probe Timer (15 seconds interval)
@@ -302,35 +320,39 @@ static void activateAudioSessionAndPlay(void) {
         if (s_keepaliveTimer) {
             dispatch_source_set_timer(s_keepaliveTimer, dispatch_time(DISPATCH_TIME_NOW, 0), 15 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
             dispatch_source_set_event_handler(s_keepaliveTimer, ^{
-                // Check & revive audio player if paused
+                // Check & revive audio player and background task
                 activateAudioSessionAndPlay();
+                renewBackgroundTask();
 
-                // A. Apple CDN HTTP HEAD (69 bytes) to refresh tunnel NAT mapping
+                // A. Instant stateless UDP DNS probe to 1.1.1.1:53 & 8.8.8.8:53 (17 bytes)
+                // Refreshes carrier NAT mapping for both IPv4 and IPv6 immediately and keeps baseband RRC warm
+                dispatch_async(queue, ^{
+                    static const uint8_t s_dnsProbe[] = {
+                        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01
+                    };
+                    int s = socket(AF_INET, SOCK_DGRAM, 0);
+                    if (s >= 0) {
+                        struct sockaddr_in sin;
+                        memset(&sin, 0, sizeof(sin));
+                        sin.sin_len = sizeof(sin);
+                        sin.sin_family = AF_INET;
+                        sin.sin_port = htons(53);
+                        inet_pton(AF_INET, "1.1.1.1", &sin.sin_addr);
+                        sendto(s, s_dnsProbe, sizeof(s_dnsProbe), 0, (struct sockaddr *)&sin, sizeof(sin));
+                        inet_pton(AF_INET, "8.8.8.8", &sin.sin_addr);
+                        sendto(s, s_dnsProbe, sizeof(s_dnsProbe), 0, (struct sockaddr *)&sin, sizeof(sin));
+                        close(s);
+                    }
+                });
+
+                // B. Apple CDN HTTP HEAD (69 bytes) to refresh tunnel NAT mapping
                 NSURL *url = [NSURL URLWithString:@"http://captive.apple.com/hotspot-detect.html"];
                 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:4.0];
                 req.HTTPMethod = @"HEAD";
                 [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *err) {
                     // Packet traveled through tunnel, NAT refreshed
                 }] resume];
-
-                // B. Non-blocking TCP probe to courier.push.apple.com:5223 to keep APNs path warm
-                dispatch_async(queue, ^{
-                    struct addrinfo hints, *res;
-                    memset(&hints, 0, sizeof(hints));
-                    hints.ai_family = AF_UNSPEC;
-                    hints.ai_socktype = SOCK_STREAM;
-                    if (getaddrinfo("courier.push.apple.com", "5223", &hints, &res) == 0 && res) {
-                        int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-                        if (sock >= 0) {
-                            fcntl(sock, F_SETFL, O_NONBLOCK);
-                            connect(sock, res->ai_addr, res->ai_addrlen);
-                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), queue, ^{
-                                close(sock);
-                            });
-                        }
-                        freeaddrinfo(res);
-                    }
-                });
             });
             dispatch_resume(s_keepaliveTimer);
             NSLog(@"[QX_APNs] Background Keepalive Heartbeat Timer started (Interval: 15s).");
@@ -351,6 +373,14 @@ static void activateAudioSessionAndPlay(void) {
         } @catch (NSException *e) {}
         s_silentAudioPlayer = nil;
         NSLog(@"[QX_APNs] Silent background audio stopped.");
+    }
+
+    if (s_bgTaskId != 0) {
+        id app = [objc_getClass("UIApplication") sharedApplication];
+        if (app) {
+            ((void (*)(id, SEL, NSUInteger))objc_msgSend)(app, sel_registerName("endBackgroundTask:"), s_bgTaskId);
+        }
+        s_bgTaskId = 0;
     }
 
     @try {
@@ -1258,7 +1288,8 @@ static void initialize_quantumultx_apns_patch(void) {
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification *note) {
         if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
-            [[QuantumultXAPNsManager sharedManager] startBackgroundKeepaliveEngine];
+            renewBackgroundTask();
+            activateAudioSessionAndPlay();
         }
     }];
 
@@ -1267,7 +1298,18 @@ static void initialize_quantumultx_apns_patch(void) {
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification *note) {
         if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
-            [[QuantumultXAPNsManager sharedManager] startBackgroundKeepaliveEngine];
+            NSDictionary *info = note.userInfo;
+            if (info) {
+                NSNumber *type = info[@"AVAudioSessionInterruptionTypeKey"];
+                // 0 = AVAudioSessionInterruptionTypeEnded
+                if (type && [type unsignedIntegerValue] == 0) {
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        activateAudioSessionAndPlay();
+                    });
+                }
+            } else {
+                activateAudioSessionAndPlay();
+            }
         }
     }];
 
@@ -1276,7 +1318,17 @@ static void initialize_quantumultx_apns_patch(void) {
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification *note) {
         if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
-            [[QuantumultXAPNsManager sharedManager] startBackgroundKeepaliveEngine];
+            activateAudioSessionAndPlay();
+        }
+    }];
+
+    [[NSNotificationCenter defaultCenter] addObserverForName:@"AVAudioSessionMediaServicesWereResetNotification"
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification *note) {
+        if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
+            s_silentAudioPlayer = nil;
+            activateAudioSessionAndPlay();
         }
     }];
 

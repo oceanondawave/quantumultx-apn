@@ -33,18 +33,21 @@ def patch_tunnel_binary(tunnel_path):
             f.seek(offset)
             f.write(nop_8)
 
-        # Restore sleepWithCompletionHandler: if previously renamed
-        # -[QTXPacketTunnelProvider sleepWithCompletionHandler:] schedules fire dates
-        # which must remain intact for clean sleep/wake cycle handling.
+        # Patch 2: Disable sleepWithCompletionHandler: so iOS never suspends the tunnel on lock screen
+        # In Stash iOS, sleepWithCompletionHandler: is NOT implemented, so the tunnel runs 24/7.
+        # In Quantumult X, sleepWithCompletionHandler: pauses internal engines and calls completionHandler(),
+        # which lets iOS put the tunnel to sleep during long lock screen periods.
+        # Renaming this selector to _leepWithCompletionHandler: ensures iOS never invokes sleep
+        # on QTXPacketTunnelProvider, keeping APNs packet processing running continuously 24/7!
         str_offset = 0x57afab
         f.seek(str_offset)
         curr_str = f.read(28)
-        if curr_str == b"_leepWithCompletionHandler:\x00":
+        if curr_str == b"sleepWithCompletionHandler:\x00":
             f.seek(str_offset)
-            f.write(b"sleepWithCompletionHandler:\x00")
-            print(f"[patch_tunnel] Restored sleepWithCompletionHandler: for clean sleep/wake handling.")
-        elif curr_str == b"sleepWithCompletionHandler:\x00":
-            print(f"[patch_tunnel] sleepWithCompletionHandler: intact.")
+            f.write(b"_leepWithCompletionHandler:\x00")
+            print(f"[patch_tunnel] Successfully disabled sleepWithCompletionHandler: (runs continuously 24/7 like Stash).")
+        elif curr_str == b"_leepWithCompletionHandler:\x00":
+            print(f"[patch_tunnel] sleepWithCompletionHandler: already disabled.")
         else:
             print(f"[patch_tunnel] Notice: Selector string at {hex(str_offset)}: {curr_str}")
 
