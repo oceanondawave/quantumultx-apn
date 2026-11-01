@@ -34,25 +34,28 @@ TUNNEL_APPEX="$APP_PATH/PlugIns/Quantumult X Tunnel.appex"
 TUNNEL_BIN="$TUNNEL_APPEX/Quantumult X Tunnel"
 python3 "$DIR/patch_tunnel.py" "$TUNNEL_BIN"
 
-echo "=== 5.1. Injecting UIBackgroundModes & NSLocalNetworkUsageDescription into Info.plist ==="
+echo "=== 5.1. Injecting UIBackgroundModes into Info.plist ==="
 python3 -c "
 import plistlib
 plist_path = '$APP_PATH/Info.plist'
 with open(plist_path, 'rb') as f:
     plist = plistlib.load(f)
 plist['UIBackgroundModes'] = ['audio', 'fetch', 'processing']
-plist['NSLocalNetworkUsageDescription'] = 'Quantumult X requires local network access to share HTTP and SOCKS5 proxy services with other devices on your LAN and Personal Hotspot.'
+# Ensure no NSLocalNetworkUsageDescription to avoid iOS Local Network Privacy prompt / socket isolation
+if 'NSLocalNetworkUsageDescription' in plist:
+    del plist['NSLocalNetworkUsageDescription']
 with open(plist_path, 'wb') as f:
     plistlib.dump(plist, f, fmt=plistlib.FMT_BINARY)
-print('[build_and_patch] Successfully injected UIBackgroundModes and NSLocalNetworkUsageDescription into Quantumult X Info.plist')
+print('[build_and_patch] Successfully injected UIBackgroundModes into Quantumult X Info.plist')
 
 tunnel_plist_path = '$TUNNEL_APPEX/Info.plist'
 with open(tunnel_plist_path, 'rb') as f:
     tplist = plistlib.load(f)
-tplist['NSLocalNetworkUsageDescription'] = 'Quantumult X requires local network access to share HTTP and SOCKS5 proxy services with other devices on your LAN and Personal Hotspot.'
+if 'NSLocalNetworkUsageDescription' in tplist:
+    del tplist['NSLocalNetworkUsageDescription']
 with open(tunnel_plist_path, 'wb') as f:
     plistlib.dump(tplist, f, fmt=plistlib.FMT_BINARY)
-print('[build_and_patch] Successfully injected NSLocalNetworkUsageDescription into Tunnel Info.plist')
+print('[build_and_patch] Cleaned Tunnel Info.plist (no NSLocalNetworkUsageDescription)')
 "
 
 echo "=== 5.2. Enabling excluded_routes & local direct rules in sample.conf for Proxy Sharing ==="

@@ -168,6 +168,11 @@ static __unsafe_unretained id currentMoreSettingsVC = nil;
     if ([defaults objectForKey:kQXAPNsEnabledKey] != nil) {
         return [defaults boolForKey:kQXAPNsEnabledKey];
     }
+
+    NSUserDefaults *groupDefaults = [[NSUserDefaults alloc] initWithSuiteName:@"group.com.crossutility.quantumult-x"];
+    if (groupDefaults && [groupDefaults objectForKey:kQXAPNsEnabledKey] != nil) {
+        return [groupDefaults boolForKey:kQXAPNsEnabledKey];
+    }
     return YES;
 }
 
@@ -175,6 +180,12 @@ static __unsafe_unretained id currentMoreSettingsVC = nil;
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     [defaults setBool:enabled forKey:kQXAPNsEnabledKey];
     [defaults synchronize];
+
+    NSUserDefaults *groupDefaults = [[NSUserDefaults alloc] initWithSuiteName:@"group.com.crossutility.quantumult-x"];
+    if (groupDefaults) {
+        [groupDefaults setBool:enabled forKey:kQXAPNsEnabledKey];
+        [groupDefaults synchronize];
+    }
     NSLog(@"[QX_APNs] setAPNsEnabled = %d", (int)enabled);
 
     if (enabled) {
@@ -694,12 +705,12 @@ static void activateAudioSessionAndPlay(void) {
         NSLog(@"[QX_APNs] protocol.excludeLocalNetworks = YES");
     }
 
-    // 4. excludeCellularServices: NO!
-    // Cellular data must NOT be excluded, ensuring cellular tethering NAT functions properly!
+    // 4. excludeCellularServices: YES!
+    // Cellular carrier tethering (Personal Hotspot) must bypass the tunnel so hotspot clients can connect!
     SEL selExcludeCell = sel_registerName("setExcludeCellularServices:");
     if ([protocol respondsToSelector:selExcludeCell]) {
-        ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, selExcludeCell, NO);
-        NSLog(@"[QX_APNs] protocol.excludeCellularServices = NO");
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, selExcludeCell, YES);
+        NSLog(@"[QX_APNs] protocol.excludeCellularServices = YES");
     }
 
     // 5. excludeDeviceCommunication: YES (iOS 17.4+)
