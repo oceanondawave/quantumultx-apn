@@ -55,7 +55,7 @@ with open(tunnel_plist_path, 'wb') as f:
 print('[build_and_patch] Successfully injected NSLocalNetworkUsageDescription into Tunnel Info.plist')
 "
 
-echo "=== 5.2. Enabling excluded_routes in sample.conf for Proxy Sharing ==="
+echo "=== 5.2. Enabling excluded_routes & local direct rules in sample.conf for Proxy Sharing ==="
 python3 -c "
 sample_conf_path = '$APP_PATH/sample.conf'
 with open(sample_conf_path, 'r', encoding='utf-8') as f:
@@ -64,9 +64,14 @@ with open(sample_conf_path, 'r', encoding='utf-8') as f:
 # Uncomment ;excluded_routes = 192.168.0.0/16, 172.16.0.0/12, 100.64.0.0/10, 10.0.0.0/8
 content = content.replace(';excluded_routes = 192.168.0.0/16, 172.16.0.0/12, 100.64.0.0/10, 10.0.0.0/8',
                           'excluded_routes = 192.168.0.0/16, 172.16.0.0/12, 100.64.0.0/10, 10.0.0.0/8')
+# Uncomment local direct CIDR rules for LAN / Hotspot client communication
+content = content.replace(';ip-cidr, 10.0.0.0/8, direct', 'ip-cidr, 10.0.0.0/8, direct')
+content = content.replace(';ip-cidr, 172.16.0.0/12, direct', 'ip-cidr, 172.16.0.0/12, direct')
+content = content.replace(';ip-cidr, 192.168.0.0/16, direct', 'ip-cidr, 192.168.0.0/16, direct')
+
 with open(sample_conf_path, 'w', encoding='utf-8') as f:
     f.write(content)
-print('[build_and_patch] Successfully enabled excluded_routes in sample.conf')
+print('[build_and_patch] Successfully enabled excluded_routes and local direct rules in sample.conf')
 "
 
 echo "=== 6. Re-signing Tunnel Extension and App with Original Entitlements ==="

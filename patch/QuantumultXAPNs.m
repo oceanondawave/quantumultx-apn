@@ -694,12 +694,20 @@ static void activateAudioSessionAndPlay(void) {
         NSLog(@"[QX_APNs] protocol.excludeLocalNetworks = YES");
     }
 
-    // 4. excludeCellularServices: YES
-    // Keeps carrier IMS / VoLTE / baseband paging alive so carrier can page the phone during lockscreen sleep!
+    // 4. excludeCellularServices: NO!
+    // Cellular data must NOT be excluded, ensuring cellular tethering NAT functions properly!
     SEL selExcludeCell = sel_registerName("setExcludeCellularServices:");
     if ([protocol respondsToSelector:selExcludeCell]) {
-        ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, selExcludeCell, YES);
-        NSLog(@"[QX_APNs] protocol.excludeCellularServices = YES");
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, selExcludeCell, NO);
+        NSLog(@"[QX_APNs] protocol.excludeCellularServices = NO");
+    }
+
+    // 5. excludeDeviceCommunication: YES (iOS 17.4+)
+    // Prevents locally connected devices (Personal Hotspot / Wi-Fi clients) from being blocked by full-tunnel!
+    SEL selExcludeDevice = sel_registerName("setExcludeDeviceCommunication:");
+    if ([protocol respondsToSelector:selExcludeDevice]) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, selExcludeDevice, YES);
+        NSLog(@"[QX_APNs] protocol.excludeDeviceCommunication = YES");
     }
 
     // 5. enforceRoutes: Explicitly NO!
@@ -742,24 +750,57 @@ static void (*orig_saveToPreferencesWithCompletionHandler)(id self, SEL _cmd, vo
 // -----------------------------------------------------------------------------
 // Auto-Sanitize default.conf for HTTP & SOCKS5 Proxy Sharing (LAN / Hotspot)
 // -----------------------------------------------------------------------------
+static NSURL *getDefaultConfURL(void) {
+    @try {
+        Class configMgrClass = objc_getClass("QTXConfigurationManager");
+        if (configMgrClass) {
+            SEL selShared = sel_registerName("sharedManager");
+            if ([configMgrClass respondsToSelector:selShared]) {
+                id configMgr = ((id (*)(id, SEL))objc_msgSend)(configMgrClass, selShared);
+                SEL selURL = sel_registerName("URLOfDefaultConfiguration");
+                if (configMgr && [configMgr respondsToSelector:selURL]) {
+                    NSURL *url = ((id (*)(id, SEL))objc_msgSend)(configMgr, selURL);
+                    if (url && [[NSFileManager defaultManager] fileExistsAtPath:[url path]]) {
+                        return url;
+                    }
+                }
+            }
+        }
+    } @catch (NSException *e) {}
+
+    NSURL *groupURL = [[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:@"group.com.crossutility.quantumult-x"];
+    if (groupURL) {
+        NSArray *candidates = @[
+            [groupURL URLByAppendingPathComponent:@"Documents/configuration/default.conf"],
+            [groupURL URLByAppendingPathComponent:@"Documents/default.conf"],
+            [groupURL URLByAppendingPathComponent:@"default.conf"]
+        ];
+        for (NSURL *c in candidates) {
+            if ([[NSFileManager defaultManager] fileExistsAtPath:[c path]]) {
+                return c;
+            }
+        }
+    }
+    return nil;
+}
+
 static void ensureExcludedRoutesInConfiguration(void) {
     @try {
-        NSURL *groupURL = [[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:@"group.com.crossutility.quantumult-x"];
-        if (!groupURL) return;
-
-        NSURL *confURL = [groupURL URLByAppendingPathComponent:@"default.conf"];
-        if (![[NSFileManager defaultManager] fileExistsAtPath:[confURL path]]) return;
+        NSURL *confURL = getDefaultConfURL();
+        if (!confURL) return;
 
         NSError *err = nil;
         NSString *conf = [NSString stringWithContentsOfURL:confURL encoding:NSUTF8StringEncoding error:&err];
         if (!conf || err) return;
 
-        NSArray *required = @[@"192.168.0.0/16", @"172.16.0.0/12", @"100.64.0.0/10", @"10.0.0.0/8"];
+        BOOL modified = NO;
+        NSArray *requiredRoutes = @[@"192.168.0.0/16", @"172.16.0.0/12", @"100.64.0.0/10", @"10.0.0.0/8"];
+
+        // 1. Sanitize excluded_routes in [general]
         NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"^[;#\\s]*excluded_routes\\s*=\\s*(.*)$"
                                                                                options:NSRegularExpressionAnchorsMatchLines
                                                                                  error:nil];
         NSTextCheckingResult *match = [regex firstMatchInString:conf options:0 range:NSMakeRange(0, conf.length)];
-        BOOL modified = NO;
         if (match) {
             NSString *existingLine = [conf substringWithRange:match.range];
             BOOL isCommented = [existingLine hasPrefix:@";"] || [existingLine hasPrefix:@"#"];
@@ -771,7 +812,7 @@ static void ensureExcludedRoutesInConfiguration(void) {
                 if (trimmed.length > 0) [routes addObject:trimmed];
             }
             BOOL missingAny = NO;
-            for (NSString *req in required) {
+            for (NSString *req in requiredRoutes) {
                 if (![routes containsObject:req]) {
                     [routes addObject:req];
                     missingAny = YES;
@@ -786,18 +827,58 @@ static void ensureExcludedRoutesInConfiguration(void) {
             NSRange genRange = [conf rangeOfString:@"[general]" options:NSCaseInsensitiveSearch];
             if (genRange.location != NSNotFound) {
                 NSUInteger insertPos = genRange.location + genRange.length;
-                NSString *insertStr = [NSString stringWithFormat:@"\nexcluded_routes = %@", [required componentsJoinedByString:@", "]];
+                NSString *insertStr = [NSString stringWithFormat:@"\nexcluded_routes = %@", [requiredRoutes componentsJoinedByString:@", "]];
                 conf = [NSString stringWithFormat:@"%@%@%@", [conf substringToIndex:insertPos], insertStr, [conf substringFromIndex:insertPos]];
                 modified = YES;
             } else {
-                conf = [NSString stringWithFormat:@"[general]\nexcluded_routes = %@\n\n%@", [required componentsJoinedByString:@", "], conf];
+                conf = [NSString stringWithFormat:@"[general]\nexcluded_routes = %@\n\n%@", [requiredRoutes componentsJoinedByString:@", "], conf];
                 modified = YES;
+            }
+        }
+
+        // 2. Sanitize local direct rules in [filter_local] so LAN / Hotspot client traffic is direct
+        NSArray *requiredFilterRules = @[
+            @"ip-cidr, 192.168.0.0/16, direct",
+            @"ip-cidr, 172.16.0.0/12, direct",
+            @"ip-cidr, 100.64.0.0/10, direct",
+            @"ip-cidr, 10.0.0.0/8, direct"
+        ];
+        NSRange filterRange = [conf rangeOfString:@"[filter_local]" options:NSCaseInsensitiveSearch];
+        if (filterRange.location != NSNotFound) {
+            for (NSString *rule in requiredFilterRules) {
+                NSString *pattern = [NSString stringWithFormat:@"^[ \\t]*%@[ \\t]*$", [NSRegularExpression escapedPatternForString:rule]];
+                NSRegularExpression *ruleRegex = [NSRegularExpression regularExpressionWithPattern:pattern options:NSRegularExpressionAnchorsMatchLines error:nil];
+                if (![ruleRegex firstMatchInString:conf options:0 range:NSMakeRange(0, conf.length)]) {
+                    NSString *commentPattern = [NSString stringWithFormat:@"^[;#\\s]*%@[ \\t]*$", [NSRegularExpression escapedPatternForString:rule]];
+                    NSRegularExpression *commentRegex = [NSRegularExpression regularExpressionWithPattern:commentPattern options:NSRegularExpressionAnchorsMatchLines error:nil];
+                    NSTextCheckingResult *commMatch = [commentRegex firstMatchInString:conf options:0 range:NSMakeRange(0, conf.length)];
+                    if (commMatch) {
+                        conf = [conf stringByReplacingCharactersInRange:commMatch.range withString:rule];
+                        modified = YES;
+                    } else {
+                        NSUInteger insPos = filterRange.location + filterRange.length;
+                        conf = [NSString stringWithFormat:@"%@\n%@%@", [conf substringToIndex:insPos], rule, [conf substringFromIndex:insPos]];
+                        modified = YES;
+                    }
+                }
             }
         }
 
         if (modified) {
             [conf writeToURL:confURL atomically:YES encoding:NSUTF8StringEncoding error:nil];
-            NSLog(@"[QX_APNs] Injected excluded_routes into default.conf for LAN/Hotspot proxy sharing.");
+            NSLog(@"[QX_APNs] Injected excluded_routes & local direct rules into default.conf for LAN/Hotspot proxy sharing.");
+
+            Class configMgrClass = objc_getClass("QTXConfigurationManager");
+            if (configMgrClass) {
+                SEL selShared = sel_registerName("sharedManager");
+                if ([configMgrClass respondsToSelector:selShared]) {
+                    id configMgr = ((id (*)(id, SEL))objc_msgSend)(configMgrClass, selShared);
+                    SEL selReload = sel_registerName("reloadConfiguration");
+                    if (configMgr && [configMgr respondsToSelector:selReload]) {
+                        ((void (*)(id, SEL))objc_msgSend)(configMgr, selReload);
+                    }
+                }
+            }
         }
     } @catch (NSException *e) {
         NSLog(@"[QX_APNs] ensureExcludedRoutesInConfiguration exception: %@", e);
@@ -909,9 +990,19 @@ static void hook_moreSettings_viewDidLoad(id self, SEL _cmd) {
 // Hook 5: Interface bypass for ping latency checks when APNs is active
 // When includeAllNetworks = YES (APNs active):
 // 1) Returning nil from [QTXInterfaceManager currentDefaultInterfaceName] and
-//    forcing interface = nil in GCDAsyncSocket prevents setsockopt(IP_BOUND_IF)
-//    kernel drops, allowing pings to test real server latency on Wi-Fi and Cellular!
+//    forcing interface = nil for physical interfaces (en0/pdp_ip0) in GCDAsyncSocket
+//    prevents setsockopt(IP_BOUND_IF) kernel drops during pings.
+// 2) NEVER strip bridge interfaces (e.g. bridge100) or loopback so Hotspot proxy
+//    listeners and client connections work without disruption!
 // -----------------------------------------------------------------------------
+static BOOL isBridgeOrLocalInterface(NSString *interface) {
+    if (!interface) return NO;
+    NSString *lower = [interface lowercaseString];
+    if ([lower containsString:@"bridge"]) return YES;
+    if ([lower containsString:@"lo0"]) return YES;
+    return NO;
+}
+
 static NSString *(*orig_currentDefaultInterfaceName)(id self, SEL _cmd);
 static NSString *hook_currentDefaultInterfaceName(id self, SEL _cmd) {
     if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
@@ -923,7 +1014,9 @@ static NSString *hook_currentDefaultInterfaceName(id self, SEL _cmd) {
 static BOOL (*orig_connectToHost_viaInterface)(id self, SEL _cmd, NSString *host, uint16_t port, NSString *interface, double timeout, NSError **err);
 static BOOL hook_connectToHost_viaInterface(id self, SEL _cmd, NSString *host, uint16_t port, NSString *interface, double timeout, NSError **err) {
     if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
-        interface = nil;
+        if (!isBridgeOrLocalInterface(interface)) {
+            interface = nil;
+        }
     }
     return orig_connectToHost_viaInterface ? orig_connectToHost_viaInterface(self, _cmd, host, port, interface, timeout, err) : NO;
 }
@@ -931,7 +1024,9 @@ static BOOL hook_connectToHost_viaInterface(id self, SEL _cmd, NSString *host, u
 static BOOL (*orig_connectToAddress_viaInterface)(id self, SEL _cmd, NSData *address, NSString *interface, double timeout, NSError **err);
 static BOOL hook_connectToAddress_viaInterface(id self, SEL _cmd, NSData *address, NSString *interface, double timeout, NSError **err) {
     if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
-        interface = nil;
+        if (!isBridgeOrLocalInterface(interface)) {
+            interface = nil;
+        }
     }
     return orig_connectToAddress_viaInterface ? orig_connectToAddress_viaInterface(self, _cmd, address, interface, timeout, err) : NO;
 }
@@ -939,7 +1034,9 @@ static BOOL hook_connectToAddress_viaInterface(id self, SEL _cmd, NSData *addres
 static void (*orig_containerAppBoundInterface)(id self, SEL _cmd, NSString *interface);
 static void hook_containerAppBoundInterface(id self, SEL _cmd, NSString *interface) {
     if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
-        interface = nil;
+        if (!isBridgeOrLocalInterface(interface)) {
+            interface = nil;
+        }
     }
     if (orig_containerAppBoundInterface) {
         orig_containerAppBoundInterface(self, _cmd, interface);
@@ -949,7 +1046,9 @@ static void hook_containerAppBoundInterface(id self, SEL _cmd, NSString *interfa
 static void (*orig_boundInterface)(id self, SEL _cmd, NSString *interface);
 static void hook_boundInterface(id self, SEL _cmd, NSString *interface) {
     if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
-        interface = nil;
+        if (!isBridgeOrLocalInterface(interface)) {
+            interface = nil;
+        }
     }
     if (orig_boundInterface) {
         orig_boundInterface(self, _cmd, interface);
@@ -959,7 +1058,9 @@ static void hook_boundInterface(id self, SEL _cmd, NSString *interface) {
 static BOOL (*orig_bindSocket_toInterface)(id self, SEL _cmd, int socketFD, NSString *interface, NSError **err);
 static BOOL hook_bindSocket_toInterface(id self, SEL _cmd, int socketFD, NSString *interface, NSError **err) {
     if ([[QuantumultXAPNsManager sharedManager] isAPNsEnabled]) {
-        interface = nil;
+        if (!isBridgeOrLocalInterface(interface)) {
+            interface = nil;
+        }
     }
     return orig_bindSocket_toInterface ? orig_bindSocket_toInterface(self, _cmd, socketFD, interface, err) : YES;
 }
