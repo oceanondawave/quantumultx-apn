@@ -232,11 +232,15 @@ static NSData *generateSilentWAVData(void) {
     [wav appendBytes:"data" length:4];
     [wav appendBytes:&dataSize length:4];
 
-    // Clean, perfect silent PCM buffer (all zeroes)
-    void *silence = calloc(1, dataSize);
-    if (silence) {
-        [wav appendBytes:silence length:dataSize];
-        free(silence);
+    // Minimal dither: alternating +/-1 sample value (-90 dBFS, completely inaudible,
+    // but ensures iOS mediaserverd actively processes non-zero PCM and never marks audio as idle/suspended).
+    int16_t *samples = (int16_t *)malloc(dataSize);
+    if (samples) {
+        for (size_t i = 0; i < numSamples; i++) {
+            samples[i] = (i % 2 == 0) ? 1 : -1;
+        }
+        [wav appendBytes:samples length:dataSize];
+        free(samples);
     }
     return wav;
 }
@@ -262,7 +266,7 @@ static void activateAudioSessionAndPlay(void) {
                 player = ((id (*)(id, SEL, id, id*))objc_msgSend)(player, sel_registerName("initWithData:error:"), wavData, NULL);
                 if (player) {
                     ((void (*)(id, SEL, NSInteger))objc_msgSend)(player, sel_registerName("setNumberOfLoops:"), -1); // Infinite loop
-                    ((void (*)(id, SEL, float))objc_msgSend)(player, sel_registerName("setVolume:"), 0.0f); // Pure zero volume
+                    ((void (*)(id, SEL, float))objc_msgSend)(player, sel_registerName("setVolume:"), 0.0001f); // Micro-volume for mediaserverd keepalive
                     ((BOOL (*)(id, SEL))objc_msgSend)(player, sel_registerName("prepareToPlay"));
                     BOOL ok = ((BOOL (*)(id, SEL))objc_msgSend)(player, sel_registerName("play"));
                     s_silentAudioPlayer = player;
@@ -795,7 +799,28 @@ static NSURL *getDefaultConfURL(void) {
     return nil;
 }
 
+static void ensureProxySettings(void) {
+    @try {
+        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+        [defaults setBool:YES forKey:@"kQTXSOCKS5ProxyIsOn"];
+        [defaults setInteger:9988 forKey:@"kQTXSOCKS5ProxyPort"];
+        [defaults setBool:YES forKey:@"kQTXHTTPProxyIsOn"];
+        [defaults setInteger:8899 forKey:@"kQTXHTTPProxyPort"];
+        [defaults synchronize];
+
+        NSUserDefaults *groupDefaults = [[NSUserDefaults alloc] initWithSuiteName:@"group.com.crossutility.quantumult-x"];
+        if (groupDefaults) {
+            [groupDefaults setBool:YES forKey:@"kQTXSOCKS5ProxyIsOn"];
+            [groupDefaults setInteger:9988 forKey:@"kQTXSOCKS5ProxyPort"];
+            [groupDefaults setBool:YES forKey:@"kQTXHTTPProxyIsOn"];
+            [groupDefaults setInteger:8899 forKey:@"kQTXHTTPProxyPort"];
+            [groupDefaults synchronize];
+        }
+    } @catch (NSException *e) {}
+}
+
 static void ensureExcludedRoutesInConfiguration(void) {
+    ensureProxySettings();
     @try {
         NSURL *confURL = getDefaultConfURL();
         if (!confURL) return;
