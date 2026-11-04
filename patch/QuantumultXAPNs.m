@@ -709,12 +709,14 @@ static void activateAudioSessionAndPlay(void) {
         NSLog(@"[QX_APNs] protocol.excludeLocalNetworks = YES");
     }
 
-    // 4. excludeCellularServices: YES!
-    // Cellular carrier tethering (Personal Hotspot) must bypass the tunnel so hotspot clients can connect!
+    // 4. excludeCellularServices: NO!
+    // Cellular carrier tethering (Personal Hotspot) is captured and routed INTO the VPN tunnel,
+    // so hotspot clients (iPad, Mac, TV) have full native internet for all apps (Telegram, Zalo, TCP/UDP)
+    // without needing to configure or install anything on the client devices!
     SEL selExcludeCell = sel_registerName("setExcludeCellularServices:");
     if ([protocol respondsToSelector:selExcludeCell]) {
-        ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, selExcludeCell, YES);
-        NSLog(@"[QX_APNs] protocol.excludeCellularServices = YES");
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(protocol, selExcludeCell, NO);
+        NSLog(@"[QX_APNs] protocol.excludeCellularServices = NO");
     }
 
     // 5. excludeDeviceCommunication: YES (iOS 17.4+)
